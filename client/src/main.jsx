@@ -76,7 +76,7 @@ const roleNav = {
     ["Overview", "overview"],
     ["Work Entry", "work"],
     ["Monitoring", "operator"],
-    ["Reports", "leader"],
+    // ["Reports", "leader"],
     ["Performance", "performance"],
   ],
   Employee: [
@@ -229,7 +229,7 @@ function Dashboard({ user, logout }) {
     [stats, setStats] = useState({}),
     [loading, setLoading] = useState(false);
   const [query, setQuery] = useState(""),
-    [projects, setProjects] = useState({ modules: [], dispatched: [] }),
+    [projects, setProjects] = useState({ modules: [], availableModules: [], dispatched: [], projectDetails: [] }),
     [modal, setModal] = useState(false),
     [editing, setEditing] = useState(null),
     [notice, setNotice] = useState("");
@@ -587,7 +587,7 @@ function Dashboard({ user, logout }) {
         <EntryModal
           page={page}
           user={user}
-          projects={projects.modules}
+          projects={projects}
           editRecord={editing}
           defaultDate={summaryDate}
           onClose={() => {
@@ -1456,16 +1456,13 @@ function DataTable({ page, rows, user, onDelete, onEdit }) {
               {showActions && (
                 <td data-label="Actions">
                   <div className="row-actions">
-                    {page === "operator" &&
-                      (user.role === "Admin" ||
-                        user.role === "Project Leader") && (
-                        <button
-                          className="edit-btn"
-                          onClick={() => onEdit(row)}
-                        >
-                          Edit
-                        </button>
-                      )}
+                    {(page === "accounts" ||
+                      (page === "operator" &&
+                        (user.role === "Admin" || user.role === "Project Leader"))) && (
+                      <button className="edit-btn" onClick={() => onEdit(row)}>
+                        Edit
+                      </button>
+                    )}
                     {(user.role === "Admin" ||
                       (page === "operator" && user.role === "Project Leader") ||
                       page === "accounts" ||
@@ -1520,6 +1517,12 @@ function EntryModal({
   onClose,
   onSaved,
 }) {
+  const projectModules = Array.isArray(projects) ? projects : (projects?.modules || []);
+  const availableProjectModules = Array.isArray(projects)
+    ? projectModules
+    : (projects?.availableModules || projectModules);
+  const projectDetails = Array.isArray(projects) ? [] : (projects?.projectDetails || []);
+  const dispatchedProjects = Array.isArray(projects) ? [] : (projects?.dispatched || []);
   const [form, setForm] = useState(() =>
     editRecord
       ? {
@@ -1537,51 +1540,68 @@ function EntryModal({
   const set = (key, value) =>
     setForm((previous) => ({ ...previous, [key]: value }));
   const special = [
-    "Office meeting",
-    "Celebration",
-    "System problem",
-    "Training",
-    "Power cut",
-    "Permission",
-    "Late",
-    "Project discussion",
-    "Half day Leave",
+    "Office meeting", "Celebration", "System problem", "Training",
+    "Power cut", "Permission", "Late", "Project discussion", "Half day Leave",
   ];
-  const projectNames = [
-    ...new Set([...projects.map((p) => p.project_name), ...special]),
-  ];
-  const models = projects.filter((p) => p.project_name === form.project_name);
-  const selectedModule = projects.find(
+  const models = availableProjectModules.filter((p) => p.project_name === form.project_name);
+  const selectedModule = projectModules.find(
     (p) => p.project_name === form.project_name && p.model_no === form.model_no,
   );
+  const availableAccountProjects = projectDetails.filter(
+    (project) => !dispatchedProjects.some(
+      (name) => String(name).trim().toLowerCase() === String(project.project_name).trim().toLowerCase()
+    ) || (editRecord && editRecord.project_name === project.project_name),
+  );
+  const selectedAccountProject = projectDetails.find(
+    (project) => project.project_name === form.project_name,
+  );
+
   useEffect(() => {
-    if (editRecord) return;
-    if (selectedModule)
-      set("estimated_time", selectedModule.module_estimated_time);
-    else if (special.includes(form.project_name))
-      set("estimated_time", "00:00");
+    if (page !== "accounts" || editRecord || !form.project_name) return;
+    if (selectedAccountProject) {
+      setForm((previous) => ({
+        ...previous,
+        start_date: selectedAccountProject.start_date || "",
+        estimated_hours: Number(selectedAccountProject.estimated_hours || 0),
+        delivery_schedule: selectedAccountProject.delivery_schedule || "",
+        hours_taken: Number(selectedAccountProject.hours_taken || 0),
+        hours_difference: Number(selectedAccountProject.hours_difference || 0),
+      }));
+    }
+  }, [page, form.project_name, editRecord, projects]);
+
+  useEffect(() => {
+    if (editRecord || page === "accounts") return;
+    if (selectedModule) set("estimated_time", selectedModule.module_estimated_time);
+    else if (special.includes(form.project_name)) set("estimated_time", "00:00");
     else set("estimated_time", "");
   }, [form.project_name, form.model_no]);
+
   async function submit(e) {
     e.preventDefault();
     setBusy(true);
     setError("");
     try {
-      let path,
-        body = { ...form };
+      let path, body = { ...form };
       if (page === "users") path = "/users";
-      else if (page === "work" || page === "operator")
-        path = "/operator-entries";
+      else if (page === "work" || page === "operator") path = "/operator-entries";
       else if (page === "leader") {
         path = "/project-leader-entries";
         body.total_hours = Number(form.total_hours);
-      } else {
+      } else if (page === "accounts") {
         path = "/accounts-entries";
-        body.estimated_hours = Number(form.estimated_hours);
-        body.hours_taken = Number(form.hours_taken);
+        // Project-derived values are calculated and validated by the server.
+        body = {
+          project_name: form.project_name,
+          dispatched: form.dispatched || "NO",
+          invoice_date: form.invoice_date || "",
+          payment_date: form.payment_date || "",
+        };
       }
       if (editRecord && page === "operator")
         await api.put(`/operator-entries/${editRecord._id}`, body);
+      else if (editRecord && page === "accounts")
+        await api.put(`/accounts-entries/${editRecord._id}`, body);
       else await api.post(path, body);
       onSaved();
     } catch (error) {
@@ -1590,147 +1610,94 @@ function EntryModal({
       setBusy(false);
     }
   }
-  const fields =
-    {
-      users: [
-        ["emp_id", "Employee ID"],
-        ["name", "Full name"],
-        ["department", "Department"],
-        [
-          "role",
-          "Role",
-          "select",
-          ["Admin", "Project Leader", "Employee", "Accounts"],
-        ],
-        ["password", "Temporary password", "password"],
-      ],
-      operator: [
-        ["estimated_time", "Estimated time (from project Excel)", "readonly"],
-        ["time_taken", "Time taken (HH:MM)"],
-        ["status", "Status", "select", ["In hand", "Complete", "QC", "QA"]],
-        ["remarks", "Remarks"],
-      ],
-      work: [
-        ["date", "Date", "date"],
-        ["project_name", "Project", "select", projectNames],
-        [
-          "model_no",
-          "Model / Module",
-          "select",
-          special.includes(form.project_name)
-            ? ["N/A"]
-            : models.map((p) => p.model_no),
-        ],
-        ["estimated_time", "Estimated time (from project Excel)", "readonly"],
-        ["time_taken", "Time taken (HH:MM)"],
-        ["status", "Status", "select", ["In hand", "Complete", "QC", "QA"]],
-        ["remarks", "Remarks"],
-      ],
-      leader: [
-        ["project_name", "Project"],
-        ["operator_name", "Employee name"],
-        ["date", "Date", "date"],
-        ["total_hours", "Total hours", "number"],
-        ["comments", "Comments"],
-      ],
-      accounts: [
-        ["project_name", "Project"],
-        ["start_date", "Start date", "date"],
-        ["estimated_hours", "Estimated hours", "number"],
-        ["delivery_schedule", "Delivery schedule", "date"],
-        ["dispatched", "Dispatched", "select", ["YES", "NO"]],
-        ["hours_taken", "Hours taken", "number"],
-        ["invoice_date", "Invoice date", "date"],
-        ["payment_date", "Payment date", "date"],
-      ],
-    }[page] || [];
+
+  const fields = {
+    users: [
+      ["emp_id", "Employee ID"], ["name", "Full name"], ["department", "Department"],
+      ["role", "Role", "select", ["Admin", "Project Leader", "Employee", "Accounts"]],
+      ["password", "Temporary password", "password"],
+    ],
+    operator: [
+      ["estimated_time", "Estimated time (from project Excel)", "readonly"],
+      ["time_taken", "Time taken (HH:MM)"],
+      ["status", "Status", "select", ["In hand", "Complete", "QC", "QA"]],
+      ["remarks", "Remarks"],
+    ],
+    work: [
+      ["date", "Date", "date"],
+      ["project_name", "Project", "select", [...new Set([...availableProjectModules.map((p) => p.project_name), ...special])]],
+      ["model_no", "Model / Module", "select", special.includes(form.project_name) ? ["N/A"] : models.map((p) => p.model_no)],
+      ["estimated_time", "Estimated time (from project Excel)", "readonly"],
+      ["time_taken", "Time taken (HH:MM)"],
+      ["status", "Status", "select", ["In hand", "Complete", "QC", "QA"]],
+      ["remarks", "Remarks"],
+    ],
+    leader: [
+      ["project_name", "Project"], ["operator_name", "Employee name"],
+      ["date", "Date", "date"], ["total_hours", "Total hours", "number"], ["comments", "Comments"],
+    ],
+    accounts: [
+      ["project_name", "Project Name", "select", availableAccountProjects.map((p) => p.project_name)],
+      ["start_date", "Start Date", "date", null, "readonly"],
+      ["estimated_hours", "Estimated Hours", "number", null, "readonly"],
+      ["delivery_schedule", "Delivery Schedule", "date", null, "readonly"],
+      ["dispatched", "Dispatched", "select", ["NO", "YES"]],
+      ["hours_taken", "Hours Taken", "number", null, "readonly"],
+      ["hours_difference", "Hours Difference", "number", null, "readonly"],
+      ["invoice_date", "Invoice Date", "date"],
+      ["payment_date", "Payment Date", "date"],
+    ],
+  }[page] || [];
+
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
-      <form
-        className="modal"
-        onSubmit={submit}
-        onMouseDown={(e) => e.stopPropagation()}
-      >
+      <form className="modal" onSubmit={submit} onMouseDown={(e) => e.stopPropagation()}>
         <div className="modal-head">
           <div>
             <span className="eyebrow">WORKSPACE RECORD</span>
-            <h3>
-              {editRecord
-                ? "Edit work entry"
-                : page === "work"
-                  ? "Submit work entry"
-                  : `Add ${page}`}
-            </h3>
-            <p>
-              Enter the details below. Required fields are marked by the
-              browser.
-            </p>
+            <h3>{editRecord ? (page === "accounts" ? "Edit Accounts Entry" : "Edit work entry") : page === "work" ? "Submit work entry" : page === "accounts" ? "Add Accounts Entry" : `Add ${page}`}</h3>
+            <p>{page === "accounts" ? "Project details and working hours are loaded automatically from project and employee records." : "Enter the details below. Required fields are marked by the browser."}</p>
           </div>
-          <button type="button" className="icon-btn" onClick={onClose}>
-            <X size={18} />
-          </button>
+          <button type="button" className="icon-btn" onClick={onClose}><X size={18} /></button>
         </div>
         <div className="form-grid">
-          {fields.map(([key, label, type = "text", options]) => (
+          {fields.map(([key, label, type = "text", options, access]) => (
             <label key={key}>
               {label}
               {type === "select" ? (
                 <select
-                  required={
-                    ["role", "project_name", "status"].includes(key) ||
-                    (key === "model_no" && !special.includes(form.project_name))
-                  }
+                  required={["role", "project_name", "status"].includes(key)}
+                  disabled={page === "accounts" && editRecord && key === "project_name"}
                   value={form[key] || ""}
                   onChange={(e) => set(key, e.target.value)}
                 >
                   <option value="">Select…</option>
-                  {options?.map((option) => (
-                    <option key={option}>{option}</option>
-                  ))}
+                  {options?.map((option) => <option key={option} value={option}>{option}</option>)}
                 </select>
               ) : (
                 <input
-                  required={[
-                    "emp_id",
-                    "name",
-                    "role",
-                    "password",
-                    "project_name",
-                    "model_no",
-                    "time_taken",
-                  ].includes(key)}
-                  readOnly={
-                    type === "readonly" || (key === "date" && page === "work")
-                  }
-                  className={type === "readonly" ? "readonly-field" : ""}
-                  type={
-                    ["date", "number", "password"].includes(type)
-                      ? type
-                      : "text"
-                  }
-                  pattern={
-                    key === "time_taken" ? "[0-9]{1,3}:[0-5][0-9]" : undefined
-                  }
+                  required={["emp_id", "name", "role", "password", "project_name", "model_no", "time_taken"].includes(key)}
+                  readOnly={type === "readonly" || access === "readonly" || (key === "date" && page === "work")}
+                  className={type === "readonly" || access === "readonly" ? "readonly-field" : ""}
+                  type={["date", "number", "password"].includes(type) ? type : "text"}
+                  min={type === "number" ? "0" : undefined}
+                  step={type === "number" ? "0.01" : undefined}
+                  pattern={key === "time_taken" ? "[0-9]{1,3}:[0-5][0-9]" : undefined}
                   value={form[key] ?? ""}
                   onChange={(e) => set(key, e.target.value)}
-                  placeholder={
-                    type === "readonly"
-                      ? "Select project and module first"
-                      : label
-                  }
+                  placeholder={type === "readonly" || access === "readonly" ? "Auto calculated" : label}
                 />
               )}
             </label>
           ))}
         </div>
+        {page === "accounts" && !editRecord && !form.project_name && (
+          <p className="empty-mini">Select a project to load its original Excel details and total employee time.</p>
+        )}
         {error && <p className="error">{error}</p>}
         <div className="modal-actions">
-          <button type="button" className="secondary" onClick={onClose}>
-            Cancel
-          </button>
-          <button className="primary" disabled={busy}>
-            {busy ? "Saving…" : "Save record"}
-          </button>
+          <button type="button" className="secondary" onClick={onClose}>Cancel</button>
+          <button className="primary" disabled={busy || (page === "accounts" && !form.project_name)}>{busy ? "Saving…" : editRecord ? "Update record" : "Save record"}</button>
         </div>
       </form>
     </div>
