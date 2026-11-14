@@ -1,0 +1,3003 @@
+import sys
+import os
+import sqlite3
+from datetime import datetime, timedelta
+import csv
+import pandas as pd
+from functools import partial
+from PyQt6 import QtWidgets, QtGui, QtCore
+
+# ===================== DATABASE PATH ======================
+DB_NAME = os.path.join(os.path.dirname(__file__), "db", "vms.db")
+
+# Helper to convert HH:MM string to float hours (e.g., "08:30" -> 8.5)
+def time_to_float(time_str):
+    try:
+        if isinstance(time_str, (int, float)):
+            return float(time_str)
+        # Handle cases like "50:" which might occur if split is on a non-standard time format
+        if not time_str or ':' not in time_str:
+            return 0.0
+        h, m = map(int, time_str.split(':'))
+        return h + m / 60.0
+    except:
+        return 0.0
+
+# Helper to convert float hours to HH:MM string (e.g., 8.75 -> "08:45")
+def float_to_time(float_hours):
+    total_minutes = int(round(float_hours * 60))
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+    return f"{hours:02d}:{minutes:02d}"
+
+# ===================== CUSTOM WIDGETS (New for Sorting/Searching) ======================
+
+class SortableTableWidget(QtWidgets.QTableWidget):
+    """QTableWidget that allows sorting by clicking headers and implements search filtering."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.horizontalHeader().sectionClicked.connect(self.sort_by_column)
+        # Enable initial sorting indicator
+        self.setSortingEnabled(True)
+        # ENFORCE FIXED EDITING MODE
+        self.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+
+    def sort_by_column(self, index):
+        # Disable sorting to prevent re-sort on data load (handled by setRowCount)
+        self.setSortingEnabled(False)
+        
+        # Get current order and section
+        current_index = self.horizontalHeader().sortIndicatorSection()
+        current_order = self.horizontalHeader().sortIndicatorOrder()
+        
+        # Determine new order
+        if current_index != index:
+            new_order = QtCore.Qt.SortOrder.AscendingOrder
+        else:
+            new_order = QtCore.Qt.SortOrder.DescendingOrder if current_order == QtCore.Qt.SortOrder.AscendingOrder else QtCore.Qt.SortOrder.DescendingOrder
+        
+        # Perform sort and set indicator
+        self.sortItems(index, new_order)
+        self.horizontalHeader().setSortIndicator(index, new_order)
+        
+        self.setSortingEnabled(True)
+
+    def setRowCount(self, count):
+        self.setSortingEnabled(False)
+        super().setRowCount(count)
+        self.setSortingEnabled(True)
+        
+    def filter_data(self, search_text):
+        search_text = search_text.lower()
+        self.setSortingEnabled(False)
+        for row in range(self.rowCount()):
+            match = False
+            for col in range(self.columnCount()):
+                item = self.item(row, col)
+                # Check for a match in the cell's text
+                if item and search_text in item.text().lower():
+                    match = True
+                    break
+            self.setRowHidden(row, not match)
+        self.setSortingEnabled(True)
+
+# ===================== USER EDIT DIALOG (New for Sorting/Searching) ======================
+class UserEditDialog(QtWidgets.QDialog):
+    def __init__(self, parent, record):
+        """ record = [id, emp_id, name, department, role] """
+        super().__init__(parent)
+        self.setWindowTitle("Edit User Details")
+        self.setModal(True)
+        self.resize(450, 250)
+        self.user_id = record[0]
+        self.original_emp_id = record[1]
+
+        layout = QtWidgets.QFormLayout(self)
+
+        self.emp_id_edit = QtWidgets.QLineEdit(record[1] or "")
+        self.name_edit = QtWidgets.QLineEdit(record[2] or "")
+        self.dept_edit = QtWidgets.QLineEdit(record[3] or "")
+        self.role_edit = QtWidgets.QComboBox()
+        self.role_edit.addItems(["Admin", "Project Leader", "Employee", "Accounts"])
+        self.role_edit.setCurrentText(record[4] or "")
+
+        layout.addRow("Emp ID", self.emp_id_edit)
+        layout.addRow("Name", self.name_edit)
+        layout.addRow("Department", self.dept_edit)
+        layout.addRow("Role", self.role_edit)
+
+        btn_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Save |
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addRow(btn_box)
+
+    def get_values(self):
+        return (
+            self.user_id,
+            self.emp_id_edit.text().strip(),
+            self.name_edit.text().strip(),
+            self.dept_edit.text().strip(),
+            self.role_edit.currentText(),
+        )
+        
+# ===================== ACCOUNTS EDIT DIALOG (NEW) ======================
+class AccountsEditDialog(QtWidgets.QDialog):
+    def __init__(self, parent, record, project_details):
+        """ 
+        record = [id, project_name, start_date, estimated_hours, delivery_schedule, 
+                  dispatched, hours_taken, hours_difference, invoice_date, payment_date]
+        """
+        super().__init__(parent)
+        self.setWindowTitle("Edit Accounts Entry")
+        self.setModal(True)
+        self.resize(500, 350)
+        self.entry_id = record[0]
+        self.project_details = project_details
+
+        layout = QtWidgets.QFormLayout(self)
+        
+        # Project Name (Read-only on edit to avoid complex re-calculations)
+        self.p_name = QtWidgets.QLineEdit(record[1] or "")
+        self.p_name.setReadOnly(True) 
+        
+        # Auto-populated Fields (Read-only)
+        self.start_date = QtWidgets.QDateEdit(QtCore.QDate.fromString(record[2], "yyyy-MM-dd"))
+        self.start_date.setCalendarPopup(True); self.start_date.setReadOnly(True)
+        
+        self.est_hours = QtWidgets.QDoubleSpinBox(); self.est_hours.setRange(0, 9999); self.est_hours.setDecimals(2)
+        self.est_hours.setValue(record[3] or 0.0); self.est_hours.setReadOnly(True)
+        
+        self.delivery = QtWidgets.QDateEdit(QtCore.QDate.fromString(record[4], "yyyy-MM-dd"))
+        self.delivery.setCalendarPopup(True); self.delivery.setReadOnly(True)
+
+        self.hours_taken = QtWidgets.QDoubleSpinBox(); self.hours_taken.setRange(0, 9999); self.hours_taken.setDecimals(2)
+        self.hours_taken.setValue(record[6] or 0.0); self.hours_taken.setReadOnly(True)
+
+        # Manual Fields (Editable)
+        self.dispatched = QtWidgets.QLineEdit(record[5] or "")
+        
+        self.invoice_date = QtWidgets.QDateEdit(QtCore.QDate.fromString(record[8], "yyyy-MM-dd"))
+        self.invoice_date.setCalendarPopup(True)
+        
+        self.payment_date = QtWidgets.QDateEdit(QtCore.QDate.fromString(record[9], "yyyy-MM-dd"))
+        self.payment_date.setCalendarPopup(True)
+
+        # Add rows
+        layout.addRow("Project Name (R/O)", self.p_name)
+        layout.addRow("Start Date (R/O)", self.start_date)
+        layout.addRow("Estimated Hours (R/O)", self.est_hours)
+        layout.addRow("Delivery Schedule (R/O)", self.delivery)
+        layout.addRow("Hours Taken (R/O)", self.hours_taken) # Re-order to group R/O fields
+
+        layout.addRow("Dispatched", self.dispatched)
+        layout.addRow("Invoice Date", self.invoice_date)
+        layout.addRow("Payment Date", self.payment_date)
+        
+        # Recalculate diff on dialog open (R/O)
+        self.hours_diff_calc = abs(self.est_hours.value() - self.hours_taken.value())
+        self.hours_diff_lbl = QtWidgets.QLabel(f"{self.hours_diff_calc:.2f}")
+        layout.addRow("Hours Difference (R/O)", self.hours_diff_lbl)
+
+
+        btn_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Save |
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+
+    def get_values(self):
+        # NOTE: Pass the calculated diff back to ensure consistency with save_entry logic
+        disp = self.dispatched.text().strip()
+        disp_save = 'YES' if disp and disp.lower() in ['yes', 'y'] else disp
+
+        return (
+            self.entry_id,
+            self.p_name.text().strip(),
+            self.start_date.date().toString("yyyy-MM-dd"),
+            float(self.est_hours.value()),
+            self.delivery.date().toString("yyyy-MM-dd"),
+            disp_save,
+            float(self.hours_taken.value()),
+            self.hours_diff_calc, # Use the pre-calculated, fixed value
+            self.invoice_date.date().toString("yyyy-MM-dd"),
+            self.payment_date.date().toString("yyyy-MM-dd")
+        )
+
+# ===================== DATABASE MANAGER ======================
+class DatabaseManager:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self._create_tables()
+
+    def _get_conn(self):
+        return sqlite3.connect(self.db_path)
+
+    def _create_tables(self):
+        conn = self._get_conn()
+        cur = conn.cursor()
+
+        # Users table (UNCHANGED)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                emp_id TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                department TEXT,
+                role TEXT NOT NULL,
+                password TEXT NOT NULL
+            );
+        """)
+
+        # Operator entries (UNCHANGED schema but ALTERED if old DB exists)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS operator_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                emp_id TEXT,
+                name TEXT,
+                department TEXT,
+                date TEXT,
+                production_hours TEXT,
+                extra_hours TEXT,
+                sl_no INTEGER,
+                project_name TEXT,
+                model_no TEXT,
+                estimated_time TEXT,
+                time_taken TEXT,
+                status TEXT,
+                remarks TEXT,
+                deleted_time_log TEXT DEFAULT '00:00'
+            );
+        """)
+        
+        # --- DB MIGRATION: Add deleted_time_log column if it doesn't exist (FIX for OperationalError) ---
+        # FIX: Check if the column exists by trying to query the schema directly
+        try:
+            cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='operator_entries';")
+            schema_row = cur.fetchone()
+            if schema_row:
+                schema = schema_row[0]
+                if 'deleted_time_log' not in schema:
+                    # If the column does not exist, add it
+                    cur.execute("ALTER TABLE operator_entries ADD COLUMN deleted_time_log TEXT DEFAULT '00:00';")
+                    conn.commit()
+        except Exception as e:
+            # Fallback or log if the migration itself fails (shouldn't happen with standard SQLite)
+            pass
+        # ---------------------------------------------------------------------------------------------------
+
+
+        # Project leader entries (UNCHANGED)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS project_leader_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_name TEXT,
+                operator_name TEXT,
+                date TEXT,
+                total_hours REAL,
+                comments TEXT
+            );
+        """)
+
+        # Accounts table (UNCHANGED)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS accounts_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_name         TEXT,
+                start_date           TEXT,
+                estimated_hours      REAL,
+                delivery_schedule TEXT,
+                dispatched           TEXT,
+                hours_taken          REAL,
+                hours_difference     REAL,
+                invoice_date         TEXT,
+                payment_date         TEXT
+            );
+        """)
+
+        # Projects table (KEPT original table)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                model_no TEXT,
+                client TEXT,
+                start_date TEXT,
+                end_date TEXT,
+                status TEXT
+            );
+        """)
+        
+        # --- NEW PROJECT MODULES TABLE (For Admin Excel Upload) ---
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS projects_modules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_name TEXT NOT NULL,
+                total_estimated_hours REAL,
+                delivery_date TEXT,
+                start_date TEXT,
+                model_no TEXT NOT NULL,
+                module_estimated_time TEXT, -- HH:MM string for the module/model
+                UNIQUE(project_name, model_no) 
+            );
+        """)
+
+        conn.commit()
+
+        # Default admin user
+        cur.execute("SELECT COUNT(*) FROM users WHERE role='Admin';")
+        if cur.fetchone()[0] == 0:
+            cur.execute("""
+                INSERT INTO users (emp_id, name, department, role, password)
+                VALUES ('admin', 'Administrator', 'Administration', 'Admin', 'admin123');
+            """)
+            conn.commit()
+
+        conn.close()
+
+    # ---------- USER OPS (UNCHANGED) ----------
+    def validate_user(self, emp_id: str, password: str):
+        conn = self._get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, emp_id, name, department, role
+            FROM users WHERE emp_id=? AND password=?;
+        """, (emp_id, password))
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            return {
+                "id": row[0],
+                "emp_id": row[1],
+                "name": row[2],
+                "department": row[3],
+                "role": row[4],
+            }
+        return None
+
+    def create_user(self, emp_id, name, department, role, password):
+        conn = self._get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO users (emp_id, name, department, role, password)
+            VALUES (?, ?, ?, ?, ?);
+        """, (emp_id, name, department, role, password))
+        conn.commit(); conn.close()
+
+    def update_user(self, user_id, emp_id, name, department, role):
+        conn = self._get_conn()
+        cur = conn.cursor(); cur.execute("""
+            UPDATE users SET emp_id=?, name=?, department=?, role=?
+            WHERE id=?;
+        """, (emp_id, name, department, role, user_id))
+        conn.commit(); conn.close()
+
+    def delete_user(self, user_id):
+        conn = self._get_conn()
+        cur = conn.cursor(); cur.execute("DELETE FROM users WHERE id=?", (user_id,))
+        conn.commit(); conn.close()
+
+    def list_users(self):
+        conn = self._get_conn()
+        cur = conn.cursor(); cur.execute("SELECT id, emp_id, name, department, role FROM users ORDER BY id DESC;")
+        rows = cur.fetchall(); conn.close()
+        return rows
+
+    # ---------- PROJECT OPS (UNCHANGED - Logic retained from previous corrected version) ----------
+    
+    # Original list_projects (for compatibility, fetches placeholder from modules)
+    def list_projects(self):
+        conn = self._get_conn()
+        cur = conn.cursor(); cur.execute("""
+            SELECT 
+                NULL, project_name, NULL, NULL, start_date, delivery_date, NULL 
+            FROM projects_modules 
+            GROUP BY project_name
+            ORDER BY start_date DESC;
+        """)
+        rows = cur.fetchall(); conn.close()
+        return rows
+        
+    def insert_project_data_from_excel(self, project_name, total_estimated_hours, delivery_date, start_date, model_no, module_estimated_time):
+        conn = self._get_conn()
+        cur = conn.cursor(); cur.execute("""
+            INSERT OR REPLACE INTO projects_modules (
+                project_name, total_estimated_hours, delivery_date, start_date, model_no, module_estimated_time
+            )
+            VALUES (?, ?, ?, ?, ?, ?);
+        """, (project_name, total_estimated_hours, delivery_date, start_date, model_no, module_estimated_time))
+        conn.commit(); conn.close()
+
+    # MODIFIED: Includes DISPATCHED status from accounts_entries
+    def list_projects_for_admin(self):
+        conn = self._get_conn()
+        cur = conn.cursor(); cur.execute("""
+            SELECT 
+                pm.project_name, 
+                pm.start_date, 
+                pm.delivery_date, 
+                pm.total_estimated_hours,
+                GROUP_CONCAT(pm.model_no || ':' || pm.module_estimated_time, '; '),
+                COALESCE(
+                    (SELECT ae.dispatched 
+                     FROM accounts_entries ae 
+                     WHERE ae.project_name = pm.project_name 
+                     ORDER BY ae.id DESC LIMIT 1),
+                    'N/A'
+                ) as dispatch_status
+            FROM projects_modules pm
+            GROUP BY pm.project_name
+            ORDER BY pm.start_date DESC;
+        """)
+        rows = cur.fetchall(); conn.close()
+        return rows
+    
+    # NEW METHOD: Get project details for Accounts Dashboard (Project Name, Est. Hours, Start Date, Delivery Date)
+    def get_all_project_names_with_details(self):
+        conn = self._get_conn()
+        cur = conn.cursor(); cur.execute("""
+            SELECT 
+                project_name, 
+                total_estimated_hours, 
+                start_date, 
+                delivery_date 
+            FROM projects_modules 
+            GROUP BY project_name
+            ORDER BY project_name;
+        """)
+        rows = cur.fetchall(); conn.close()
+        return rows
+    
+    # NEW METHOD: Calculate total time taken by ALL operators for a specific project
+    def calculate_total_time_taken_for_project(self, project_name):
+        conn = self._get_conn()
+        cur = conn.cursor(); cur.execute("""
+            SELECT time_taken 
+            FROM operator_entries
+            WHERE project_name = ? AND status != 'DELETED' AND deleted_time_log = '00:00';
+        """, (project_name,))
+        
+        rows = cur.fetchall(); conn.close()
+        
+        total_time_taken_float = sum(time_to_float(row[0]) for row in rows)
+        return total_time_taken_float
+        
+    def get_all_projects_and_models(self):
+        conn = self._get_conn()
+        cur = conn.cursor(); cur.execute("""
+            SELECT project_name, model_no, module_estimated_time 
+            FROM projects_modules
+            ORDER BY project_name, model_no;
+        """)
+        rows = cur.fetchall(); conn.close()
+        return rows
+
+    # NEW: Function to check if project is dispatched, ignoring one specific account entry ID.
+    def is_project_dispatched(self, project_name, exclude_id=None):
+        conn = self._get_conn()
+        cur = conn.cursor()
+        
+        # Base query to check for any 'YES' dispatch entry
+        query = """
+            SELECT dispatched FROM accounts_entries
+            WHERE project_name = ? AND dispatched = 'YES'
+        """
+        params = [project_name]
+
+        if exclude_id is not None:
+            query += " AND id != ?"
+            params.append(exclude_id)
+
+        cur.execute(query, params)
+        row = cur.fetchone()
+        conn.close()
+        return row is not None
+
+    def get_non_dispatched_projects_for_dropdown(self):
+        """Fetches project names that are NOT currently marked as dispatched ('YES')."""
+        all_projects = self.get_all_project_names_with_details()
+        non_dispatched_names = []
+        for name, _, _, _ in all_projects:
+            if not self.is_project_dispatched(name):
+                non_dispatched_names.append(name)
+        return non_dispatched_names
+
+    # ---------- OPERATOR OPS (UNCHANGED) ----------
+    
+    def save_operator_row(self, user, date, prod, extra, sl_no,
+                          project, model, est, taken, status, remarks):
+        
+        taken_time_str = taken 
+        taken_hours_float = time_to_float(taken_time_str)
+        max_prod_hours = 8.5 # 8:30 in float
+        
+        conn = self._get_conn(); cur = conn.cursor()
+
+        # 1. Get already consumed production hours for this date (CRITICAL FIX)
+        cur.execute("""
+            SELECT SUM(CAST(SUBSTR(production_hours, 1, INSTR(production_hours, ':') - 1) AS REAL) + 
+                       CAST(SUBSTR(production_hours, INSTR(production_hours, ':') + 1) AS REAL) / 60.0)
+            FROM operator_entries
+            WHERE emp_id = ? AND date = ? AND status != 'DELETED' AND deleted_time_log = '00:00';
+        """, (user["emp_id"], date))
+        
+        # Fetch the sum, handle None case
+        consumed_prod_hours = cur.fetchone()[0] or 0.0
+        
+        remaining_prod_capacity = max_prod_hours - consumed_prod_hours
+
+        # 2. Determine split for the NEW entry (CRITICAL FIX)
+        if taken_hours_float <= remaining_prod_capacity:
+            # Entire taken time fits within remaining production hours
+            prod_hours_float = taken_hours_float
+            extra_hours_float = 0.0
+        else:
+            # Part of taken time covers remaining production hours, rest is extra
+            prod_hours_float = max(0.0, remaining_prod_capacity)
+            extra_hours_float = taken_hours_float - prod_hours_float
+
+        # 3. Convert floats back to HH:MM strings for saving
+        prod_hours_str = float_to_time(prod_hours_float)
+        extra_hours_str = float_to_time(extra_hours_float)
+        
+        # 4. Save the entry (rest of the original code)
+        cur.execute("""
+            INSERT INTO operator_entries (
+                user_id, emp_id, name, department,
+                date, production_hours, extra_hours,
+                sl_no, project_name, model_no,
+                estimated_time, time_taken, status, remarks
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """, (
+            user["id"], user["emp_id"], user["name"], user["department"],
+            date, prod_hours_str, extra_hours_str, sl_no, project, model, est, taken_time_str, status, remarks
+        ))
+        
+        conn.commit(); conn.close()
+
+    def list_operator_entries_full(self):
+        conn = self._get_conn()
+        cur = conn.cursor(); cur.execute("""
+            SELECT id, date, emp_id, name, department,
+                   project_name, model_no, estimated_time,
+                   time_taken, status, remarks
+            FROM operator_entries
+            WHERE status != 'DELETED' AND deleted_time_log = '00:00'
+            ORDER BY date DESC, id DESC;
+        """); rows = cur.fetchall(); conn.close()
+        return rows
+
+    def update_operator_entry(self, entry_id, estimated_time, time_taken, status, remarks):
+        conn = self._get_conn()
+        cur = conn.cursor()
+        
+        # Recalculate Production/Extra hours based on new time_taken value
+        taken_hours_float = time_to_float(time_taken)
+        max_prod_hours = 8.5
+        
+        if taken_hours_float <= max_prod_hours:
+            prod_hours_str = float_to_time(taken_hours_float) if taken_hours_float > 0 else "00:00"
+            extra_hours_str = "00:00"
+        else:
+            prod_hours_str = float_to_time(max_prod_hours)
+            extra_hours_float = taken_hours_float - max_prod_hours
+            extra_hours_str = float_to_time(extra_hours_float)
+            
+        cur.execute("""
+            UPDATE operator_entries
+            SET estimated_time=?, time_taken=?, status=?, remarks=?, production_hours=?, extra_hours=?
+            WHERE id=?;
+        """, (estimated_time, time_taken, status, remarks, prod_hours_str, extra_hours_str, entry_id)); conn.commit(); conn.close()
+
+    # MODIFIED: Admin delete logic to restore time (by logging it)
+    def delete_operator_entry(self, entry_id):
+        conn = self._get_conn()
+        cur = conn.cursor()
+        
+        # 1. Fetch the time_taken before deletion
+        cur.execute("SELECT emp_id, name, department, date, model_no, estimated_time, time_taken, remarks FROM operator_entries WHERE id=?;", (entry_id,))
+        row = cur.fetchone()
+        
+        if row:
+            emp_id, name, department, date, model_no, estimated_time, deleted_time_str, remarks = row
+            
+            # 2. Log the deleted time into a new entry (as restoration log)
+            cur.execute("""
+                INSERT INTO operator_entries (
+                    emp_id, name, department, date,
+                    production_hours, extra_hours, sl_no,
+                    project_name, model_no, estimated_time,
+                    time_taken, status, remarks, deleted_time_log
+                ) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """, (
+                emp_id, name, department, date,
+                '00:00', '00:00', 0,
+                'Time Restored (Admin Delete)', model_no, estimated_time,
+                deleted_time_str, 'DELETED', remarks, deleted_time_str
+            ))
+            
+            # 3. Delete the original entry
+            cur.execute("DELETE FROM operator_entries WHERE id=?;", (entry_id,))
+        
+        conn.commit(); conn.close()
+        
+    # --- Performance Data Query (UNCHANGED) ---
+    def calculate_operator_performance_data(self, emp_id, project_name, model_no):
+        conn = self._get_conn()
+        cur = conn.cursor()
+        
+        latest_est_time = 0.0
+
+        try:
+            # 1. Get all entries for the operator, project, and model (EXCLUDE DELETED)
+            cur.execute("""
+                SELECT time_taken, estimated_time, date 
+                FROM operator_entries
+                WHERE emp_id = ? AND project_name = ? AND model_no = ? AND status != 'DELETED' AND deleted_time_log = '00:00'
+                ORDER BY date DESC;
+            """, (emp_id, project_name, model_no))
+            
+            rows = cur.fetchall()
+            
+            total_time_taken_float = sum(time_to_float(row[0]) for row in rows)
+            
+            # 2. Get the latest estimated time for the module/model from projects_modules (the unchanging target)
+            if project_name not in ["Office meeting", "Celebration", "System problem", "Training", "Power cut", "Permission", "Late", "Project discussion", "Half day Leave"]:
+                cur.execute("""
+                    SELECT module_estimated_time 
+                    FROM projects_modules 
+                    WHERE project_name = ? AND model_no = ? 
+                    ORDER BY id DESC LIMIT 1;
+                """, (project_name, model_no))
+                est_time_str = cur.fetchone()
+                latest_est_time = time_to_float(est_time_str[0]) if est_time_str else 0.0
+            else:
+                # For Non-Project tasks, use the estimated time logged in the operator_entries (if any)
+                if rows:
+                    latest_est_time = time_to_float(rows[0][1]) # Use estimated time from the latest log entry
+            
+            
+            # 3. Calculate Total Estimated Time 
+            total_estimated_time_float = latest_est_time 
+            
+            
+            performance_data = {
+                "operator_id": emp_id,
+                "project_name": project_name,
+                "model_no": model_no,
+                "entry_count": len(rows),
+                "latest_estimated_time": float_to_time(latest_est_time),
+                "total_estimated_time_float": total_estimated_time_float, # Fixed: Should be the single target time
+                "total_time_taken_float": total_time_taken_float,
+            }
+            
+            # 4. Calculate performance status
+            if total_estimated_time_float > 0 and total_time_taken_float > 0:
+                diff = total_estimated_time_float - total_time_taken_float
+                
+                # Performance status based on difference
+                if diff >= total_estimated_time_float * 0.2: 
+                    performance_data["status"] = "Excellent (>= 20% faster)"
+                elif diff > 0: 
+                    performance_data["status"] = "Good (Faster)"
+                elif abs(diff) <= total_estimated_time_float * 0.05:
+                    performance_data["status"] = "On Track (Matches Est.)"
+                elif diff > total_estimated_time_float * -0.2:
+                    performance_data["status"] = "Fair (Up to 20% slower)"
+                else:
+                    performance_data["status"] = "Needs Improvement (> 20% slower)"
+            elif total_time_taken_float > 0 and total_estimated_time_float == 0:
+                performance_data["status"] = "Time Logged (Est. Missing)"
+            else:
+                performance_data["status"] = "No Data"
+
+            return performance_data
+
+        finally:
+            conn.close()
+
+
+    # ---------- PROJECT LEADER OPS (UNCHANGED) ----------
+    def insert_project_leader_entry(self, project_name, operator_name,
+                                    date_str, total_hours, comments):
+        conn = self._get_conn()
+        cur = conn.cursor(); cur.execute("""
+            INSERT INTO project_leader_entries (
+                project_name, operator_name, date, total_hours, comments
+            )
+            VALUES (?, ?, ?, ?, ?);
+        """, (project_name, operator_name, date_str, total_hours, comments)); conn.commit(); conn.close()
+
+    def list_project_leader_entries(self):
+        conn = self._get_conn()
+        cur = conn.cursor(); cur.execute("""
+            SELECT project_name, operator_name, date, total_hours, comments
+            FROM project_leader_entries
+            ORDER BY date DESC;
+        """); rows = cur.fetchall(); conn.close()
+        return rows
+
+    def list_project_leader_entries_full(self):
+        conn = self._get_conn()
+        cur = conn.cursor(); cur.execute("""
+            SELECT id, project_name, operator_name, date, total_hours, comments
+            FROM project_leader_entries
+            ORDER BY date DESC, id DESC;
+        """); rows = cur.fetchall(); conn.close()
+        return rows
+
+    def update_project_leader_entry(self, entry_id, project_name,
+                                    operator_name, date_str, total_hours, comments):
+        conn = self._get_conn()
+        cur = conn.cursor(); cur.execute("""
+            UPDATE project_leader_entries
+            SET project_name=?, operator_name=?, date=?, total_hours=?, comments=?
+            WHERE id=?;
+        """, (project_name, operator_name, date_str, total_hours, comments, entry_id)); conn.commit(); conn.close()
+
+    def delete_project_leader_entry(self, entry_id):
+        conn = self._get_conn()
+        cur = conn.cursor(); cur.execute("DELETE FROM project_leader_entries WHERE id=?;", (entry_id,)); conn.commit(); conn.close()
+
+    # ---------- ACCOUNTS OPS (UNCHANGED) ----------
+    def insert_accounts_entry(self, project_name, start_date, estimated_hours,
+                              delivery_schedule, dispatched, hours_taken,
+                              hours_difference, invoice_date, payment_date):
+        conn = self._get_conn()
+        cur = conn.cursor(); cur.execute("""
+            INSERT INTO accounts_entries (
+                project_name, start_date, estimated_hours,
+                delivery_schedule, dispatched, hours_taken,
+                hours_difference, invoice_date, payment_date
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """, (
+            project_name, start_date, estimated_hours,
+            delivery_schedule, dispatched, hours_taken,
+            hours_difference, invoice_date, payment_date
+        )); conn.commit(); conn.close()
+
+    def list_accounts_entries_full(self):
+        """Fetches all accounts entries including ID for action buttons."""
+        conn = self._get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, project_name, start_date, estimated_hours,
+                   delivery_schedule, dispatched, hours_taken,
+                   hours_difference, invoice_date, payment_date
+            FROM accounts_entries
+            ORDER BY start_date DESC, id DESC;
+        """)
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+        
+    def check_project_dispatched(self, project_name):
+        """Checks if a project already has a 'YES' dispatched entry."""
+        # Use the general is_project_dispatched with no exclusion
+        return self.is_project_dispatched(project_name)
+
+    def get_non_dispatched_project_names(self):
+        """Fetches project names that are NOT currently marked as dispatched ('YES')."""
+        return self.get_non_dispatched_projects_for_dropdown()
+
+    def update_accounts_entry(self, entry_id, project_name, start_date, estimated_hours,
+                              delivery_schedule, dispatched, hours_taken,
+                              hours_difference, invoice_date, payment_date):
+        """Updates an existing accounts entry."""
+        conn = self._get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE accounts_entries SET
+                project_name=?, start_date=?, estimated_hours=?,
+                delivery_schedule=?, dispatched=?, hours_taken=?,
+                hours_difference=?, invoice_date=?, payment_date=?
+            WHERE id=?;
+        """, (
+            project_name, start_date, estimated_hours,
+            delivery_schedule, dispatched, hours_taken,
+            hours_difference, invoice_date, payment_date,
+            entry_id
+        )); conn.commit(); conn.close()
+
+    def delete_accounts_entry(self, entry_id):
+        """Deletes an accounts entry."""
+        conn = self._get_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM accounts_entries WHERE id=?;", (entry_id,)); conn.commit(); conn.close()
+        
+
+# ===================== EXCEL STYLE MIXIN (UNCHANGED) ======================
+class ExcelStyledWidget:
+    def apply_excel_style(self):
+        self.setStyleSheet("""
+            QWidget {
+                font-family: 'Segoe UI';
+                font-size: 10pt;
+            }
+            QTableWidget {
+                background-color: #e9f5e5;
+                gridline-color: #b6d7a8;
+            }
+            QHeaderView::section {
+                background-color: #10793F;
+                color: white;
+                font-weight: bold;
+            }
+            QPushButton {
+                background-color: #10793F;
+                color: white;
+                padding: 6px 12px;
+                border-radius: 3px;
+            }
+            QPushButton:hover {
+                background-color: #0c5b30;
+            }
+        """)
+
+
+# ===================== OPERATOR EDIT DIALOG (UNCHANGED) ======================
+class OperatorEditDialog(QtWidgets.QDialog):
+    def __init__(self, parent, record):
+        """
+        record = [id, date, emp_id, name, department,
+                  project_name, model_no, estimated_time,
+                  time_taken, status, remarks]
+        """
+        super().__init__(parent)
+        self.setWindowTitle("Edit Operator Entry")
+        self.setModal(True)
+        self.resize(420, 260)
+
+        layout = QtWidgets.QFormLayout(self)
+
+        info = QtWidgets.QLabel(f"{record[3]} ({record[2]}) – {record[5]}")
+        layout.addRow("Entry:", info)
+
+        self.est_edit = QtWidgets.QLineEdit(record[7] or "")
+        self.taken_edit = QtWidgets.QLineEdit(record[8] or "")
+        self.status_edit = QtWidgets.QLineEdit(record[9] or "")
+        self.remarks_edit = QtWidgets.QLineEdit(record[10] or "")
+
+        layout.addRow("Estimated Time (HH:MM)", self.est_edit)
+        layout.addRow("Time Taken (HH:MM)", self.taken_edit)
+        self.status_edit.setText(self.status_edit.text().replace("Complete", "Comp")) # Convert back to old status before saving
+        layout.addRow("Status", self.status_edit)
+        layout.addRow("Remarks", self.remarks_edit)
+
+        btn_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Save |
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addRow(btn_box)
+
+    def get_values(self):
+        # Convert 'Complete' back to 'Comp' for DB storage, if present
+        status = self.status_edit.text().strip()
+        if status.lower() == 'complete':
+             status = 'Comp'
+             
+        return (
+            self.est_edit.text().strip(),
+            self.taken_edit.text().strip(),
+            status,
+            self.remarks_edit.text().strip(),
+        )
+
+
+# ===================== PROJECT LEADER EDIT DIALOG (UNCHANGED) ======================
+class ProjectLeaderEditDialog(QtWidgets.QDialog):
+    def __init__(self, parent, record):
+        """
+        record = [id, project_name, operator_name, date, total_hours, comments]
+        """
+        super().__init__(parent)
+        self.setWindowTitle("Edit Project Leader Entry")
+        self.setModal(True)
+        self.resize(420, 260)
+
+        layout = QtWidgets.QFormLayout(self)
+
+        self.proj_edit = QtWidgets.QLineEdit(record[1] or "")
+        self.op_edit = QtWidgets.QLineEdit(record[2] or "")
+        self.date_edit = QtWidgets.QLineEdit(record[3] or "")
+        self.hours_edit = QtWidgets.QLineEdit(str(record[4] or ""))
+        self.comm_edit = QtWidgets.QLineEdit(record[5] or "")
+
+        layout.addRow("Project Name", self.proj_edit)
+        layout.addRow("Operator Name", self.op_edit)
+        layout.addRow("Date (YYYY-MM-DD)", self.date_edit)
+        layout.addRow("Total Hours", self.hours_edit)
+        layout.addRow("Comments", self.comm_edit)
+
+        btn_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Save |
+            QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addRow(btn_box)
+
+    def get_values(self):
+        return (
+            self.proj_edit.text().strip(),
+            self.op_edit.text().strip(),
+            self.date_edit.text().strip(),
+            float(self.hours_edit.text().strip() or 0),
+            self.comm_edit.text().strip(),
+        )
+
+
+# ===================== PERFORMANCE CHART DIALOG (UNCHANGED) ======================
+class PerformanceChartDialog(QtWidgets.QDialog):
+    def __init__(self, parent, db: DatabaseManager):
+        super().__init__(parent)
+        self.db = db
+        self.setWindowTitle("Performance Chart Dashboard")
+        self.setModal(True)
+        self.resize(800, 600)
+        self._build_ui()
+        self.load_operators()
+
+    def _build_ui(self):
+        main_layout = QtWidgets.QVBoxLayout(self)
+        
+        # --- Filters ---
+        filter_layout = QtWidgets.QHBoxLayout()
+        
+        # Operator Dropdown
+        self.cb_operator = QtWidgets.QComboBox()
+        self.cb_operator.setPlaceholderText("Select Operator")
+        filter_layout.addWidget(QtWidgets.QLabel("Operator:"))
+        filter_layout.addWidget(self.cb_operator)
+        
+        # Project Dropdown
+        self.cb_project = QtWidgets.QComboBox()
+        self.cb_project.setPlaceholderText("Select Project")
+        self.cb_project.currentIndexChanged.connect(self.load_models)
+        filter_layout.addWidget(QtWidgets.QLabel("Project:"))
+        filter_layout.addWidget(self.cb_project)
+        
+        # Model Dropdown
+        self.cb_model = QtWidgets.QComboBox()
+        self.cb_model.setPlaceholderText("Select Model")
+        filter_layout.addWidget(QtWidgets.QLabel("Model:"))
+        filter_layout.addWidget(self.cb_model)
+        
+        # Load Chart Button
+        self.btn_load_chart = QtWidgets.QPushButton("Load Chart")
+        self.btn_load_chart.clicked.connect(self.display_chart)
+        filter_layout.addWidget(self.btn_load_chart)
+        
+        main_layout.addLayout(filter_layout)
+        
+        # --- Chart/Data Display Area ---
+        
+        # 1. Visualization Container (For the simulated bar chart)
+        self.visualization_frame = QtWidgets.QFrame()
+        self.visualization_frame.setStyleSheet("background-color:#fff; border:1px solid #ccc; padding:10px;")
+        self.chart_layout = QtWidgets.QVBoxLayout(self.visualization_frame)
+        self.chart_layout.setSpacing(10)
+        
+        self.perf_title = QtWidgets.QLabel("Performance Overview: Select filters and click 'Load Chart'")
+        self.perf_title.setStyleSheet("font-weight:bold; font-size:12pt; color:#10793F;")
+        self.chart_layout.addWidget(self.perf_title)
+        
+        # Placeholders for Chart elements
+        # MODIFIED LABEL
+        self.est_bar_lbl = QtWidgets.QLabel("Estimated Time (Module Target):")
+        self.est_bar = QtWidgets.QProgressBar()
+        self.est_bar.setTextVisible(True)
+        self.est_bar.setStyleSheet("QProgressBar { text-align: center; color: black; background-color: #d9ead3; } QProgressBar::chunk { background-color: #a9d18e; }")
+        
+        # MODIFIED LABEL
+        self.taken_bar_lbl = QtWidgets.QLabel("Total Time Taken (All Logged Entries):")
+        self.taken_bar = QtWidgets.QProgressBar()
+        self.taken_bar.setTextVisible(True)
+        self.taken_bar.setStyleSheet("QProgressBar { text-align: center; color: black; background-color: #d9ead3; } QProgressBar::chunk { background-color: #10793F; }")
+        
+        self.status_lbl = QtWidgets.QLabel("Status: N/A")
+        self.status_lbl.setStyleSheet("font-weight:bold; font-size:11pt;")
+        
+        # Hide until data is loaded
+        self.est_bar.hide(); self.taken_bar.hide(); self.est_bar_lbl.hide(); self.taken_bar_lbl.hide(); self.status_lbl.hide()
+        
+        self.chart_layout.addWidget(self.est_bar_lbl); self.chart_layout.addWidget(self.est_bar)
+        self.chart_layout.addWidget(self.taken_bar_lbl); self.chart_layout.addWidget(self.taken_bar)
+        self.chart_layout.addWidget(self.status_lbl)
+        
+        main_layout.addWidget(self.visualization_frame)
+        
+        # 2. Detail Table
+        self.detail_table = SortableTableWidget()
+        # Adjusted row count to 3, as requested (removing 'Latest Estimated Time')
+        self.detail_table.setRowCount(3) 
+        self.detail_table.setColumnCount(2)
+        self.detail_table.setHorizontalHeaderLabels(["Metric", "Value (HH:MM or Count)"])
+        self.detail_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch) # Stretch this one for readability
+        
+        # MODIFIED METRIC LABELS 
+        self.detail_table.setItem(0, 0, QtWidgets.QTableWidgetItem("Total Entries Logged"))
+        self.detail_table.setItem(1, 0, QtWidgets.QTableWidgetItem("Total Estimated Time")) # Renamed to reflect the target time
+        self.detail_table.setItem(2, 0, QtWidgets.QTableWidgetItem("Total Time Taken"))
+        
+        # Set initial values for the detail table
+        for r in range(3):
+            self.detail_table.setItem(r, 1, QtWidgets.QTableWidgetItem("N/A"))
+        
+        main_layout.addWidget(self.detail_table)
+
+
+    def load_operators(self):
+        self.cb_operator.clear()
+        self.cb_operator.addItem("Select Operator")
+        
+        conn = self.db._get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT emp_id, name FROM users WHERE role='Employee' OR role='Project Leader' ORDER BY name;")
+        operators = cur.fetchall()
+        conn.close()
+        
+        unique_operators = {}
+        for emp_id, name in operators:
+            unique_operators[emp_id] = name
+            
+        for emp_id, name in sorted(unique_operators.items()):
+            self.cb_operator.addItem(f"{name} ({emp_id})", emp_id)
+            
+        self.load_projects()
+
+    def load_projects(self):
+        self.cb_project.clear()
+        self.cb_project.addItem("Select Project")
+        
+        conn = self.db._get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT project_name FROM operator_entries WHERE status != 'DELETED' AND deleted_time_log = '00:00' ORDER BY project_name;")
+        projects = cur.fetchall()
+        conn.close()
+        
+        for project_name in projects:
+            self.cb_project.addItem(project_name[0])
+
+    def load_models(self):
+        self.cb_model.clear()
+        self.cb_model.addItem("Select Model")
+        project_name = self.cb_project.currentText()
+        
+        if not project_name or project_name == "Select Project":
+            return
+            
+        conn = self.db._get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT DISTINCT model_no 
+            FROM operator_entries 
+            WHERE project_name = ? AND model_no != '' 
+            AND status != 'DELETED' AND deleted_time_log = '00:00' 
+            ORDER BY model_no;
+        """, (project_name,))
+        models = cur.fetchall()
+        conn.close()
+        
+        for model_no in models:
+            self.cb_model.addItem(model_no[0])
+
+    def display_chart(self):
+        emp_id = self.cb_operator.currentData()
+        project_name = self.cb_project.currentText()
+        model_no = self.cb_model.currentText()
+        
+        if not emp_id or project_name == "Select Project" or model_no == "Select Model":
+            QtWidgets.QMessageBox.warning(self, "Missing Selection", "Please select an Operator, Project, and Model.")
+            return
+
+        # 1. Get Performance Data
+        try:
+            data = self.db.calculate_operator_performance_data(emp_id, project_name, model_no)
+        except sqlite3.ProgrammingError as e:
+            QtWidgets.QMessageBox.critical(self, "Database Error", f"Failed to load performance data: {e}")
+            return
+        
+        total_est_float = data['total_estimated_time_float']
+        total_taken_float = data['total_time_taken_float']
+        entry_count = data['entry_count']
+        status = data['status']
+
+        # 2. Update the Detail Table
+        self.detail_table.setRowCount(3) # Ensure correct row count after removing Latest Est Time
+        self.detail_table.setItem(0, 1, QtWidgets.QTableWidgetItem(str(entry_count)))
+        self.detail_table.setItem(1, 1, QtWidgets.QTableWidgetItem(float_to_time(total_est_float)))
+        self.detail_table.setItem(2, 1, QtWidgets.QTableWidgetItem(float_to_time(total_taken_float)))
+
+        # 3. Update Visualization (Simulated Bar Chart)
+        self.perf_title.setText(f"Performance for {self.cb_operator.currentText()} on {project_name} ({model_no})")
+        
+        # Update Labels in the visualization frame
+        self.est_bar_lbl.setText(f"Estimated Time (Module Target): {float_to_time(total_est_float)}")
+        self.taken_bar_lbl.setText(f"Total Time Taken (All Logged Entries): {float_to_time(total_taken_float)}")
+        
+        self.est_bar.show(); self.taken_bar.show(); self.est_bar_lbl.show(); self.taken_bar_lbl.show(); self.status_lbl.show()
+        
+        # Determine maximum for scale (use 120% of the larger value, or a minimum default)
+        max_val = max(total_est_float, total_taken_float, 0.1) * 1.2
+        
+        if max_val == 0:
+            self.est_bar.setValue(0); self.taken_bar.setValue(0)
+            self.est_bar.setFormat("00:00")
+            self.taken_bar.setFormat("00:00")
+        else:
+            # Set range in minutes for QProgressBar
+            max_range = int(round(max_val * 60))
+            self.est_bar.setRange(0, max_range) 
+            self.taken_bar.setRange(0, max_range)
+
+            self.est_bar.setValue(int(round(total_est_float * 60)))
+            self.taken_bar.setValue(int(round(total_taken_float * 60)))
+            
+            # Format the display text to HH:MM
+            self.est_bar.setFormat(float_to_time(total_est_float))
+            self.taken_bar.setFormat(float_to_time(total_taken_float))
+        
+        # 4. Update Status Label and Colors
+        self.status_lbl.setText(f"Status: {status}")
+        
+        if "Excellent" in status or "Good" in status or "On Track" in status:
+            self.status_lbl.setStyleSheet("font-weight:bold; font-size:11pt; color:green;")
+            self.taken_bar.setStyleSheet("QProgressBar { text-align: center; color: black; background-color: #d9ead3; } QProgressBar::chunk { background-color: #38761d; }") # Darker green
+        elif "Improvement" in status or "Fair" in status:
+            self.status_lbl.setStyleSheet("font-weight:bold; font-size:11pt; color:red;")
+            self.taken_bar.setStyleSheet("QProgressBar { text-align: center; color: black; background-color: #d9ead3; } QProgressBar::chunk { background-color: #cc0000; }") # Red
+        else:
+            self.status_lbl.setStyleSheet("font-weight:bold; font-size:11pt; color:black;")
+            self.taken_bar.setStyleSheet("QProgressBar { text-align: center; color: black; background-color: #d9ead3; } QProgressBar::chunk { background-color: #10793F; }") # Default Green
+
+    # Added for global refresh call
+    def refresh_project_dropdowns(self):
+        self.project_data = self.db.get_all_projects_and_models()
+        self.load_projects()
+
+# ===================== ADMIN DASHBOARD (UNCHANGED) ======================
+class AdminDashboard(QtWidgets.QWidget, ExcelStyledWidget):
+    def __init__(self, db: DatabaseManager, logout_callback=None):
+        super().__init__()
+        self.db = db
+        self.logout_callback = logout_callback
+        self._build_ui()
+        self.apply_excel_style()
+        self.refresh()
+
+    def _build_ui(self):
+        main_layout = QtWidgets.QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+
+        # ---------- HEADER (GREEN) ----------
+        header = QtWidgets.QFrame()
+        header.setStyleSheet("background-color:#10793F;")
+        h_layout = QtWidgets.QHBoxLayout(header)
+        h_layout.setContentsMargins(16, 8, 16, 8)
+
+        title = QtWidgets.QLabel("Admin Dashboard - VMS Tool")
+        title_font = QtGui.QFont("Segoe UI", 14, QtGui.QFont.Weight.Bold)
+        title.setFont(title_font)
+        title.setStyleSheet("color:white;")
+        h_layout.addWidget(title)
+
+        h_layout.addStretch()
+
+        logout_btn = QtWidgets.QPushButton("Logout")
+        logout_btn.setStyleSheet("""
+            QPushButton {
+                background-color:#ffffff;
+                color:#10793F;
+                padding:6px 14px;
+                border-radius:6px;
+                font-weight:bold;
+            }
+            QPushButton:hover {
+                background-color:#e6f2ec;
+            }
+        """)
+        logout_btn.clicked.connect(self.on_logout_clicked)
+        h_layout.addWidget(logout_btn)
+
+        main_layout.addWidget(header)
+
+        # ---------- CONTENT AREA ----------
+        content = QtWidgets.QWidget()
+        content_layout = QtWidgets.QVBoxLayout(content)
+        content_layout.setContentsMargins(12, 12, 12, 12)
+
+        self.tabs = QtWidgets.QTabWidget()
+        content_layout.addWidget(self.tabs)
+
+        main_layout.addWidget(content)
+
+        # Build individual tabs
+        self._build_users_tab()
+        self._build_projects_tab()
+        self._build_operator_history_tab()
+        self._build_pl_history_tab()  
+
+    def on_logout_clicked(self):
+        if self.logout_callback:
+            self.logout_callback()
+
+    # -------- USERS TAB (UNCHANGED) ----------
+    def _build_users_tab(self):
+        user_tab = QtWidgets.QWidget()
+        outer = QtWidgets.QVBoxLayout(user_tab)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(12)
+
+        form = QtWidgets.QGridLayout()
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(8)
+
+        self.emp_id = QtWidgets.QLineEdit()
+        self.name = QtWidgets.QLineEdit()
+        self.department = QtWidgets.QLineEdit()
+        self.role = QtWidgets.QComboBox()
+        self.role.addItems(["Admin", "Project Leader", "Employee", "Accounts"])
+        self.password = QtWidgets.QLineEdit()
+        self.password.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+
+        form.addWidget(QtWidgets.QLabel("Emp ID"), 0, 0)
+        form.addWidget(self.emp_id, 0, 1)
+        form.addWidget(QtWidgets.QLabel("Name"), 0, 2)
+        form.addWidget(self.name, 0, 3)
+
+        form.addWidget(QtWidgets.QLabel("Department"), 1, 0)
+        form.addWidget(self.department, 1, 1)
+        form.addWidget(QtWidgets.QLabel("Role"), 1, 2)
+        form.addWidget(self.role, 1, 3)
+
+        form.addWidget(QtWidgets.QLabel("Password"), 2, 0)
+        form.addWidget(self.password, 2, 1)
+
+        btn_add = QtWidgets.QPushButton("Add User")
+        btn_add.clicked.connect(self.add_user)
+        form.addWidget(btn_add, 3, 0, 1, 4)
+
+        outer.addLayout(form)
+        
+        # Search/Filter Bar
+        self.u_search_edit = QtWidgets.QLineEdit()
+        self.u_search_edit.setPlaceholderText("Search Users...")
+        self.u_search_edit.textChanged.connect(lambda text: self.users_table.filter_data(text))
+        outer.addWidget(self.u_search_edit)
+
+        self.users_table = SortableTableWidget()
+        self.users_table.setColumnCount(6) # Added Actions column
+        self.users_table.setHorizontalHeaderLabels(
+            ["ID", "Emp ID", "Name", "Department", "Role", "Actions"]
+        )
+        self.users_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.users_table.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.Interactive) # Actions column can be stretched/interactive
+        
+        self.users_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+
+        outer.addWidget(self.users_table)
+
+        self.tabs.addTab(user_tab, "Users")
+        
+    def refresh_users(self):
+        users = self.db.list_users()
+        self.users_table.setRowCount(len(users))
+        
+        for r, row in enumerate(users):
+            user_id = row[0]
+            
+            for c, val in enumerate(row):
+                self.users_table.setItem(r, c, QtWidgets.QTableWidgetItem(str(val)))
+            
+            # Actions (Edit + Delete)
+            action_widget = QtWidgets.QWidget()
+            h = QtWidgets.QHBoxLayout(action_widget)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(4)
+
+            btn_edit = QtWidgets.QPushButton("Edit")
+            btn_edit.setStyleSheet("padding:2px 6px;")
+            btn_edit.clicked.connect(partial(self.edit_user, row))
+            
+            btn_del = QtWidgets.QPushButton("Delete")
+            btn_del.setStyleSheet("padding:2px 6px;")
+            btn_del.clicked.connect(partial(self.delete_user, user_id))
+
+            h.addWidget(btn_edit)
+            h.addWidget(btn_del)
+            h.addStretch()
+
+            self.users_table.setCellWidget(r, 5, action_widget)
+
+    def edit_user(self, record):
+        dlg = UserEditDialog(self, record)
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            user_id, emp_id, name, dept, role = dlg.get_values()
+            try:
+                self.db.update_user(user_id, emp_id, name, dept, role)
+                QtWidgets.QMessageBox.information(self, "Success", "User updated successfully.")
+                self.refresh_users()
+            except sqlite3.IntegrityError:
+                QtWidgets.QMessageBox.critical(self, "Error", "Employee ID already exists.")
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Error", f"Failed to update user: {e}")
+
+    def delete_user(self, user_id):
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Confirm Delete",
+            "Are you sure you want to permanently delete this user?",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
+        )
+        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+            self.db.delete_user(user_id)
+            QtWidgets.QMessageBox.information(self, "Deleted", "User permanently deleted.")
+            self.refresh_users()
+            
+    # -------- PROJECTS TAB (UNCHANGED) ----------
+    def _build_projects_tab(self):
+        proj_tab = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(proj_tab)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(12)
+
+        p_form = QtWidgets.QGridLayout()
+        p_form.setHorizontalSpacing(10)
+        p_form.setVerticalSpacing(8)
+
+        # Excel Upload UI (Keep Upload Excel button)
+        btn_upload_excel = QtWidgets.QPushButton("Upload Project Excel")
+        btn_upload_excel.clicked.connect(self.upload_project_excel)
+        p_form.addWidget(btn_upload_excel, 0, 0, 1, 4)
+        
+        # Search/Filter Bar
+        self.p_search_edit = QtWidgets.QLineEdit()
+        self.p_search_edit.setPlaceholderText("Search Projects...")
+        self.p_search_edit.textChanged.connect(lambda text: self.proj_table.filter_data(text))
+        p_form.addWidget(self.p_search_edit, 1, 0, 1, 4)
+        
+        # Dummy variables kept for compatibility
+        self.p_name = QtWidgets.QLineEdit(); self.p_model = QtWidgets.QLineEdit()
+        self.p_client = QtWidgets.QLineEdit(); self.p_status = QtWidgets.QLineEdit()
+        self.p_start = QtWidgets.QDateEdit(); self.p_end = QtWidgets.QDateEdit()
+
+        v.addLayout(p_form)
+
+        self.proj_table = SortableTableWidget()
+        self.proj_table.setColumnCount(6) # Added Dispatch Status Column
+        self.proj_table.setHorizontalHeaderLabels(
+            ["Project Name", "Start Date", "Delivery Date", "Total Est. Hours", "Modules (Model:Est)", "Dispatch Status"]
+        )
+        self.proj_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.proj_table.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.Stretch) # Stretch Module column
+        
+        self.proj_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+
+        v.addWidget(self.proj_table)
+
+        self.tabs.addTab(proj_tab, "Projects")
+
+    # -------- OPERATOR HISTORY TAB (UNCHANGED) ----------
+    def _build_operator_history_tab(self):
+        tab = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        
+        # Search/Filter Bar
+        self.op_history_search_edit = QtWidgets.QLineEdit()
+        self.op_history_search_edit.setPlaceholderText("Search Operator History...")
+        self.op_history_search_edit.textChanged.connect(lambda text: self.operator_table.filter_data(text))
+        btn_row.addWidget(self.op_history_search_edit)
+
+        # --- Performance Chart Button ---
+        btn_performance_chart = QtWidgets.QPushButton("Performance Chart")
+        btn_performance_chart.clicked.connect(self.show_performance_chart)
+        btn_row.addWidget(btn_performance_chart)
+        
+        
+        btn_row.addStretch() # Push elements left
+        
+        layout.addLayout(btn_row)
+
+        self.operator_table = SortableTableWidget()
+        self.operator_table.setColumnCount(12)
+        self.operator_table.setHorizontalHeaderLabels([
+            "ID", "Date", "Emp ID", "Name", "Dept",
+            "Project", "Model", "Est Time", "Time Taken",
+            "Status", "Remarks", "Actions"
+        ])
+        
+        # Fix column widths - set to content, allow stretch on Remarks/Actions
+        self.operator_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.operator_table.horizontalHeader().setSectionResizeMode(10, QtWidgets.QHeaderView.ResizeMode.Stretch) # Remarks
+        self.operator_table.horizontalHeader().setSectionResizeMode(11, QtWidgets.QHeaderView.ResizeMode.Interactive) # Actions
+        
+        self.operator_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+
+        layout.addWidget(self.operator_table)
+
+        self.tabs.addTab(tab, "Operator History")
+
+    # -------- PROJECT LEADER HISTORY TAB (REMOVED) ----------
+    def _build_pl_history_tab(self):
+        pass 
+        
+    # -------- BASIC OPS (Users / Projects) ----------
+    def add_user(self):
+        # Existing add user logic...
+        try:
+            self.db.create_user(
+                self.emp_id.text().strip(),
+                self.name.text().strip(),
+                self.department.text().strip(),
+                self.role.currentText(),
+                self.password.text().strip()
+            )
+            QtWidgets.QMessageBox.information(self, "Success", "User added")
+            self.emp_id.clear()
+            self.name.clear()
+            self.department.clear()
+            self.password.clear()
+            self.refresh()
+        except sqlite3.IntegrityError:
+            QtWidgets.QMessageBox.critical(self, "Error", "Employee ID already exists.")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to add user: {e}")
+
+    def add_project(self):
+        # Original function, now unused
+        QtWidgets.QMessageBox.warning(self, "Feature Disabled", "Manual project entry is disabled. Please use 'Upload Project Excel'.")
+        
+    # Admin's Project Excel Upload Logic (UNCHANGED)
+    def upload_project_excel(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select Project Excel File",
+            "",
+            "Excel Files (*.xlsx *.xls)"
+        )
+        if not path:
+            return
+
+        try:
+            # Check if file exists and is readable (precautionary)
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"File not found: {path}")
+
+            # Added engine='openpyxl' for robust modern Excel file reading
+            # Ensure openpyxl is installed: pip install pandas openpyxl
+            df = pd.read_excel(path, sheet_name=0, engine='openpyxl')
+            
+            # Clean column names by stripping whitespace
+            df.columns = df.columns.str.strip() 
+
+            required_cols = ["Project Name", "Estimated Time (hours)", "Module Number", "Delivery Date"]
+            
+            if not all(col in df.columns for col in required_cols):
+                raise ValueError("Missing essential columns: Project Name, Estimated Time (hours), Module Number, Delivery Date. Please check column headers.")
+
+            if "Start Date" not in df.columns:
+                df["Start Date"] = datetime.now().strftime("%Y-%m-%d")
+            
+            # Use fillna('') to handle missing values robustly before grouping/string operations
+            df = df.fillna('')
+            
+            project_groups = df.groupby("Project Name")
+            
+            total_projects_processed = 0
+            
+            for name, group in project_groups:
+                project_name = str(name).strip()
+                if not project_name: continue
+                
+                total_projects_processed += 1
+
+                # Find overall estimates (if present) for total project summary fields
+                total_est_row = group[group["Module Number"].astype(str).str.contains("Overall Estimate", na=False)]
+                
+                if not total_est_row.empty:
+                    # Use .iloc[0] to safely access the first value from the filtered row
+                    total_estimated_hours = float(total_est_row["Estimated Time (hours)"].iloc[0]) if total_est_row["Estimated Time (hours)"].iloc[0] != '' else 0.0
+                    delivery_date = total_est_row["Delivery Date"].iloc[0]
+                    start_date = total_est_row["Start Date"].iloc[0]
+                else:
+                    # Calculate totals from module rows if overall estimate is missing
+                    module_rows = group[~group["Module Number"].astype(str).str.contains("Total|Overall Estimate", na=False)]
+                    
+                    # Convert to numeric first, handling non-numeric data as NaN, then fill NaN with 0 for sum
+                    numeric_module_hours = pd.to_numeric(module_rows["Estimated Time (hours)"], errors='coerce').fillna(0)
+                    total_estimated_hours = numeric_module_hours.sum()
+                    
+                    delivery_date = group["Delivery Date"].max()
+                    start_date = group["Start Date"].min()
+
+                # Format dates robustly
+                try:
+                    delivery_date_str = pd.to_datetime(delivery_date).strftime("%Y-%m-%d")
+                except:
+                    delivery_date_str = str(delivery_date).split(' ')[0] if delivery_date else ''
+                    
+                try:
+                    start_date_str = pd.to_datetime(start_date).strftime("%Y-%m-%d")
+                except:
+                    start_date_str = str(start_date).split(' ')[0] if start_date else ''
+
+
+                for _, row in group.iterrows():
+                    module_number = str(row["Module Number"]).strip()
+                    
+                    if "Overall Estimate" in module_number or "Total" in module_number or not module_number:
+                        continue
+                    
+                    model_no = module_number.split('(')[0].strip() 
+                    
+                    module_hours_raw = row["Estimated Time (hours)"]
+                    
+                    # Ensure module hours is a float for time_to_float
+                    if module_hours_raw == '':
+                        module_hours_float = 0.0
+                    else:
+                        try:
+                            module_hours_float = float(module_hours_raw)
+                        except (ValueError, TypeError):
+                            module_hours_float = 0.0 # Default to 0 if conversion fails
+                        
+                    module_estimated_time_str = float_to_time(module_hours_float) 
+
+                    # Insert or Replace Module Data
+                    self.db.insert_project_data_from_excel(
+                        project_name, 
+                        total_estimated_hours, 
+                        delivery_date_str, 
+                        start_date_str, 
+                        model_no, 
+                        module_estimated_time_str
+                    )
+            
+            # Refresh projects tab after successful import
+            self.refresh()
+            QtWidgets.QMessageBox.information(self, "Success", f"Project data from Excel imported and refreshed successfully. ({total_projects_processed} unique projects processed)")
+
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to import Excel. Check file format or column content:\n{e}")
+
+    def refresh(self):
+        self.refresh_users()
+
+        # Projects (Uses list_projects_for_admin to show module data + dispatch status)
+        pro = self.db.list_projects_for_admin() 
+        self.proj_table.setRowCount(len(pro))
+        
+        for r, row in enumerate(pro):
+            for c, val in enumerate(row):
+                self.proj_table.setItem(r, c, QtWidgets.QTableWidgetItem(str(val)))
+                
+        self.proj_table.horizontalHeader().resizeSections(QtWidgets.QHeaderView.ResizeMode.ResizeToContents) # Force resize after data load
+
+        # History (Manual call for refresh needed due to removal of Refresh button)
+        self.refresh_operator_history()
+
+    # Added for global refresh call
+    def refresh_project_dropdowns(self):
+        # Admin doesn't have project dropdowns that need filtering based on dispatch status
+        pass
+
+    # -------- OPERATOR HISTORY OPS (UNCHANGED) ----------
+    def refresh_operator_history(self):
+        rows = self.db.list_operator_entries_full() # Excludes DELETED entries
+        self.operator_table.setRowCount(len(rows))
+
+        for r, row in enumerate(rows):
+            entry_id = row[0]
+            # Convert status 'Comp' to 'Complete' for display
+            display_row = list(row)
+            if display_row[9] == 'Comp': display_row[9] = 'Complete'
+            
+            for c in range(11):
+                self.operator_table.setItem(r, c, QtWidgets.QTableWidgetItem(str(display_row[c])))
+
+            # Actions (Edit + Delete) - UNCHANGED
+            action_widget = QtWidgets.QWidget()
+            h = QtWidgets.QHBoxLayout(action_widget)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(4)
+
+            btn_edit = QtWidgets.QPushButton("Edit")
+            btn_edit.setStyleSheet("padding:2px 6px;")
+            btn_edit.clicked.connect(partial(self.edit_operator_entry, entry_id))
+
+            btn_del = QtWidgets.QPushButton("Delete")
+            btn_del.setStyleSheet("padding:2px 6px;")
+            btn_del.clicked.connect(partial(self.delete_operator_entry, entry_id))
+
+            h.addWidget(btn_edit)
+            h.addWidget(btn_del)
+            h.addStretch()
+
+            self.operator_table.setCellWidget(r, 11, action_widget)
+            
+        self.operator_table.horizontalHeader().resizeSections(QtWidgets.QHeaderView.ResizeMode.ResizeToContents) # Force resize after data load
+        self.operator_table.horizontalHeader().setSectionResizeMode(10, QtWidgets.QHeaderView.ResizeMode.Stretch) # Remarks column stretch remains
+        self.operator_table.horizontalHeader().setSectionResizeMode(11, QtWidgets.QHeaderView.ResizeMode.Interactive) # Actions column interactive remains
+
+    def edit_operator_entry(self, entry_id):
+        # Fetch data based on ID
+        conn = self.db._get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, date, emp_id, name, department,
+                   project_name, model_no, estimated_time,
+                   time_taken, status, remarks
+            FROM operator_entries
+            WHERE id=?;
+        """, (entry_id,))
+        record = cur.fetchone()
+        conn.close()
+        
+        if not record:
+             QtWidgets.QMessageBox.warning(self, "Error", "Entry not found.")
+             return
+             
+        # Convert tuple to list and map 'Comp' to 'Complete' for display in dialog
+        record_list = list(record)
+        if record_list[9] == 'Comp': record_list[9] = 'Complete'
+
+
+        dlg = OperatorEditDialog(self, record_list)
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            est, taken, status, remarks = dlg.get_values()
+            
+            self.db.update_operator_entry(entry_id, est, taken, status, remarks)
+            
+            self.refresh_operator_history()
+
+    def delete_operator_entry(self, entry_id):
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Confirm Delete",
+            "Are you sure you want to delete this operator entry? The time will be marked for restoration.",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
+        )
+        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+            # This triggers logging and deletion, and the entry will disappear upon refresh_operator_history
+            self.db.delete_operator_entry(entry_id)
+            QtWidgets.QMessageBox.information(self, "Deleted", "Entry deleted. Time logged for restoration.")
+            self.refresh_operator_history()
+
+    def upload_operator_csv(self):
+        QtWidgets.QMessageBox.information(self, "Feature Disabled", "CSV Upload is disabled. Operator entries must be submitted via the Operator Dashboard.")
+
+    # --- NEW: Performance Chart Function ---
+    def show_performance_chart(self):
+        dlg = PerformanceChartDialog(self, self.db)
+        dlg.exec()
+
+
+# ===================== OPERATOR DASHBOARD (UNCHANGED) ======================
+class OperatorDashboard(QtWidgets.QWidget):
+    def __init__(self, db: DatabaseManager, user: dict, logout_callback=None):
+        super().__init__()
+        self.db = db
+        self.user = user
+        self.logout_callback = logout_callback
+        self.project_data = self._load_project_data() 
+        
+        # 1. Initialize history_table here first (before _build_ui)
+        self.history_table = SortableTableWidget()
+        self.history_table.setColumnCount(7) 
+        self.history_table.setHorizontalHeaderLabels(["Date", "Project", "Model", "Estimated", "Taken", "Status", "Remarks"])
+
+        self._build_ui()
+        self.load_history()
+
+    # New method to structure project data for easy access {Project: {Model: Est_Time}}
+    def _load_project_data(self):
+        data = self.db.get_all_projects_and_models()
+        projects = {}
+        for proj_name, model_no, est_time in data:
+            if proj_name not in projects:
+                projects[proj_name] = {}
+            projects[proj_name][model_no] = est_time
+        return projects
+
+    def _build_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # ================= HEADER =================
+        header = QtWidgets.QFrame()
+        header.setStyleSheet("background-color: #10793F; padding: 15px;")
+        h = QtWidgets.QGridLayout(header)
+        h.setContentsMargins(25, 12, 25, 12)
+        h.setHorizontalSpacing(40)
+        h.setVerticalSpacing(12)
+
+        # Variables defined inside _build_ui 
+        label_style = "color:white; font-weight:bold; font-size:13pt;"
+        box_style = "background:white; padding:6px; font-size:13pt; color:black;"
+
+        nameL = QtWidgets.QLabel("Name"); nameL.setStyleSheet(label_style)
+        self.nameV = QtWidgets.QLabel(self.user["name"]); self.nameV.setStyleSheet(box_style)
+
+        dateL = QtWidgets.QLabel("Date"); dateL.setStyleSheet(label_style)
+        self.date = QtWidgets.QDateEdit(QtCore.QDate.currentDate()); self.date.setEnabled(False)
+        self.date.setCalendarPopup(True); self.date.setStyleSheet("background:white; padding:6px; font-size:13pt; color:black;"); self.date.setDisplayFormat("yyyy-MM-dd")
+
+        deptL = QtWidgets.QLabel("Department"); deptL.setStyleSheet(label_style) 
+        self.deptV = QtWidgets.QLabel(self.user["department"]); self.deptV.setStyleSheet(box_style) 
+
+        # MODIFIED: Display remaining production hours / total extra hours consumed
+        prodL = QtWidgets.QLabel("Remaining Prod Hours"); prodL.setStyleSheet(label_style)
+        self.prod = QtWidgets.QTimeEdit(); 
+        self.prod.setTime(QtCore.QTime(8, 30))
+        self.prod.setEnabled(False); self.prod.setDisplayFormat("HH:mm"); self.prod.setStyleSheet("background:white; padding:6px; font-size:13pt; color:black;")
+
+        extraL = QtWidgets.QLabel("Total Extra Hrs Consumed"); extraL.setStyleSheet(label_style)
+        self.extra = QtWidgets.QTimeEdit(); 
+        self.extra.setTime(QtCore.QTime(0, 0))
+        self.extra.setEnabled(False); self.extra.setDisplayFormat("HH:mm"); self.extra.setStyleSheet("background:white; padding:6px; font-size:13pt; color:black;")
+
+        self.logout_btn = QtWidgets.QPushButton("Logout"); self.logout_btn.setFixedSize(140, 45)
+        self.logout_btn.setStyleSheet("""
+            QPushButton { background:white; color:#10793F; font-weight:bold; padding:10px; border-radius:6px; font-size:14pt; }
+            QPushButton:hover { background:#e6f2e8; }
+        """); self.logout_btn.clicked.connect(self._logout)
+
+        # HEADER ALIGNMENT
+        h.addWidget(nameL, 0, 0); h.addWidget(self.nameV, 0, 1)
+        h.addWidget(dateL, 0, 2); h.addWidget(self.date, 0, 3)
+
+        h.addWidget(deptL, 1, 0); h.addWidget(self.deptV, 1, 1) 
+        h.addWidget(prodL, 1, 2); h.addWidget(self.prod, 1, 3)
+
+        h.addWidget(extraL, 2, 2); h.addWidget(self.extra, 2, 3)
+        h.addWidget(self.logout_btn, 2, 0, 1, 2)
+
+        layout.addWidget(header)
+
+        # ================= ENTRY SECTION =================
+        entry_frame = QtWidgets.QFrame()
+        entry_frame.setStyleSheet("background-color:#d9ead3; padding:10px;")
+        entry_layout = QtWidgets.QGridLayout(entry_frame)
+        entry_layout.setContentsMargins(12, 12, 12, 12)
+
+        # UI Headers (7 functional inputs + Submit = 8 columns)
+        header_labels = ["Project Name", "Model No", "Est Hrs:Min", 
+                             "Taken Hrs", "Taken Min", "Status", "Remarks", "Actions"] # Combined Est H/M for single column
+
+        for i, text in enumerate(header_labels):
+            lbl = QtWidgets.QLabel(text)
+            lbl.setStyleSheet("font-weight:bold; color:black;")
+            entry_layout.addWidget(lbl, 0, i)
+
+        # Options (Updated list)
+        default_projects = ["Office meeting", "Celebration", "System problem", 
+                            "Training", "Power cut", "Permission", "Late", "Project discussion", "Half day Leave"]
+        # CHANGED: 'Comp' to 'Complete'
+        status_options = ["In hand", "Complete", "QC", "QA"]
+
+        # 1. Project Name Dropdown (Column 0)
+        self.cb_project = QtWidgets.QComboBox()
+        self.cb_project.addItem("Select Project")
+        # Projects will be loaded in load_history
+        self.cb_project.currentIndexChanged.connect(self._update_modules)
+        self.cb_project.setEditable(False)
+
+        # 2. Model No Dropdown (Column 1)
+        self.cb_model = QtWidgets.QComboBox()
+        self.cb_model.setEnabled(False)
+        self.cb_model.currentIndexChanged.connect(self._update_estimated_time)
+        self.cb_model.setEditable(False) 
+
+        # 3. Estimated Hours (Column 2) - COMBINED H:M in one layout
+        est_h_m_layout = QtWidgets.QHBoxLayout()
+        self.cb_est_h = QtWidgets.QComboBox(); self.cb_est_h.addItems([f"{i:02d}" for i in range(0, 100)])
+        self.cb_est_h.setCurrentText("00"); self.cb_est_h.setEnabled(False)
+        self.cb_est_h.setEditable(False) 
+        self.cb_est_m = QtWidgets.QComboBox(); self.cb_est_m.addItems(["00", "15", "30", "45"])
+        self.cb_est_m.setCurrentText("00"); self.cb_est_m.setEnabled(False)
+        est_h_m_layout.addWidget(self.cb_est_h)
+        est_h_m_layout.addWidget(QtWidgets.QLabel(":"))
+        est_h_m_layout.addWidget(self.cb_est_m)
+        est_h_m_layout.setStretch(0, 1); est_h_m_layout.setStretch(2, 1)
+        
+        # 4. Taken Hrs (Column 3)
+        self.cb_taken_h = QtWidgets.QComboBox(); self.cb_taken_h.addItems([f"{i:02d}" for i in range(0, 20)])
+        self.cb_taken_h.setCurrentText("00")
+        
+        # 5. Taken Min (Column 4)
+        self.cb_taken_m = QtWidgets.QComboBox(); self.cb_taken_m.addItems(["00", "15", "30", "45"])
+        self.cb_taken_m.setCurrentText("00")
+
+        # 6. Status (Column 5)
+        self.cb_status = QtWidgets.QComboBox(); self.cb_status.addItems(status_options)
+        self.cb_status.setEditable(False)
+        
+        # 7. Remarks (Column 6)
+        self.remarks_edit = QtWidgets.QLineEdit()
+        self.remarks_edit.setReadOnly(False)
+
+        # 8. Submit Button (Column 7)
+        self.btn_submit = QtWidgets.QPushButton("Submit")
+        self.btn_submit.setStyleSheet("background:#10793F; color:white; font-weight:bold; padding:6px 15px;")
+        self.btn_submit.clicked.connect(self.submit_entry)
+        
+        # --- Layout setup ---
+        entry_layout.addWidget(self.cb_project, 1, 0)
+        entry_layout.addWidget(self.cb_model, 1, 1)
+        entry_layout.addLayout(est_h_m_layout, 1, 2) # Est H/M Layout
+        entry_layout.addWidget(self.cb_taken_h, 1, 3) 
+        entry_layout.addWidget(self.cb_taken_m, 1, 4) 
+        entry_layout.addWidget(self.cb_status, 1, 5) 
+        entry_layout.addWidget(self.remarks_edit, 1, 6) 
+        
+        # Submit Button placed in Column 7
+        submit_h_layout = QtWidgets.QHBoxLayout()
+        submit_h_layout.addWidget(self.btn_submit)
+        entry_layout.addLayout(submit_h_layout, 1, 7)
+        
+        entry_layout.setColumnStretch(6, 1)
+
+        layout.addWidget(entry_frame)
+        
+        # Search/Filter Bar for history table
+        self.history_search_edit = QtWidgets.QLineEdit()
+        self.history_search_edit.setPlaceholderText("Search History...")
+        self.history_search_edit.textChanged.connect(lambda text: self.history_table.filter_data(text))
+        
+        history_control = QtWidgets.QGridLayout() 
+        history_control.addWidget(QtWidgets.QLabel("Filter/Search:"), 0, 0)
+        history_control.addWidget(self.history_search_edit, 0, 1)
+        history_control.setColumnStretch(1, 1)
+
+        layout.addLayout(history_control)
+
+
+        # ================= HISTORY TABLE =================
+        self.history_table = SortableTableWidget()
+        self.history_table.setColumnCount(7) 
+        self.history_table.setHorizontalHeaderLabels(["Date", "Project", "Model", "Estimated", "Taken", "Status", "Remarks"])
+        self.history_table.horizontalHeader().setStyleSheet("""
+            QHeaderView::section {
+                background-color:#bdd7b5;
+                color:black;
+                font-weight:bold;
+                padding:4px;
+            }
+        """)
+
+        # MODIFIED: Fixed column widths for Operator History
+        self.history_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.history_table.horizontalHeader().setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeMode.Stretch) # Remarks column stretch
+
+
+        layout.addWidget(self.history_table)
+
+    # -------- LOGIC FOR PROJECT/MODULE DROPDOWNS (UNCHANGED) --------
+    def _update_modules(self, index):
+        project_name = self.cb_project.currentText()
+        self.cb_model.clear()
+        
+        self.cb_est_h.setCurrentText("00")
+        self.cb_est_m.setCurrentText("00")
+
+        if project_name == "Select Project":
+            self.cb_model.setEnabled(False)
+            return
+
+        if project_name in self.project_data:
+            self.cb_model.setEnabled(True)
+            self.cb_model.addItem("Select Module")
+            self.cb_model.addItems(sorted(self.project_data[project_name].keys()))
+        else:
+            self.cb_model.setEnabled(False)
+            self.cb_model.addItem("N/A")
+            self.cb_est_h.setEnabled(False) # Keep disabled, as estimated time should come from model/module if available
+
+    def _update_estimated_time(self, index):
+        project_name = self.cb_project.currentText()
+        model_no = self.cb_model.currentText()
+        
+        if project_name in self.project_data and model_no in self.project_data[project_name]:
+            est_time_str = self.project_data[project_name][model_no]
+            try:
+                h, m = map(int, est_time_str.split(':'))
+                self.cb_est_h.setCurrentText(f"{h:02d}")
+                self.cb_est_m.setCurrentText(f"{m:02d}") 
+            except:
+                self.cb_est_h.setCurrentText("00")
+                self.cb_est_m.setCurrentText("00")
+        
+        elif model_no == "Select Module" or model_no == "N/A":
+            self.cb_est_h.setCurrentText("00")
+            self.cb_est_m.setCurrentText("00")
+
+    # -------- LOGOUT (UNCHANGED) --------
+    def _logout(self):
+        if self.logout_callback:
+            self.logout_callback()
+
+    # -------- SAVE ENTRY (UNCHANGED) --------
+    def submit_entry(self):
+        project = self.cb_project.currentText()
+        model = self.cb_model.currentText()
+        
+        est_time_str = f"{self.cb_est_h.currentText()}:{self.cb_est_m.currentText()}" 
+        taken_time_str = f"{self.cb_taken_h.currentText()}:{self.cb_taken_m.currentText()}"
+        
+        if project == "Select Project":
+             QtWidgets.QMessageBox.warning(self, "Missing", "Please select a Project.")
+             return
+             
+        if project in self.project_data and model == "Select Module":
+             QtWidgets.QMessageBox.warning(self, "Missing", "Please select a Module Number.")
+             return
+
+        # Check if Time Taken is 00:00
+        if time_to_float(taken_time_str) == 0.0:
+            QtWidgets.QMessageBox.warning(self, "Missing", "Time Taken cannot be 00:00.")
+            return
+
+        # Convert 'Complete' back to 'Comp' for DB storage
+        status = self.cb_status.currentText()
+        if status == 'Complete': status = 'Comp'
+
+        self.db.save_operator_row(
+            self.user,
+            self.date.date().toString("yyyy-MM-dd"),
+            "00:00", 
+            "00:00", 
+            1, 
+            project,
+            model if model != "N/A" else "", 
+            est_time_str,
+            taken_time_str,
+            status,
+            self.remarks_edit.text().strip(),
+        )
+
+        QtWidgets.QMessageBox.information(self, "Success", "Entry saved successfully. Production/Extra hours calculated.")
+        
+        self.remarks_edit.clear()
+        self.cb_taken_h.setCurrentText("00")
+        self.cb_taken_m.setCurrentText("00")
+        self.load_history()
+
+    # -------- LOAD TODAY HISTORY (MODIFIED: Project dropdown population and Status display) --------
+    def load_history(self):
+        conn = self.db._get_conn()
+        cur = conn.cursor()
+        today = self.date.date().toString("yyyy-MM-dd")
+        
+        # --- Update Project Dropdown: Only show non-dispatched projects + Default tasks ---
+        self.cb_project.blockSignals(True)
+        self.cb_project.clear()
+        self.cb_project.addItem("Select Project")
+        
+        # Add non-dispatched projects
+        active_projects = self.db.get_non_dispatched_projects_for_dropdown()
+        
+        # Add non-project activities
+        default_projects = ["Office meeting", "Celebration", "System problem", 
+                            "Training", "Power cut", "Permission", "Late", "Project discussion", "Half day Leave"]
+        
+        combined_projects = sorted(active_projects + default_projects)
+        self.cb_project.addItems(combined_projects)
+        self.cb_project.blockSignals(False)
+
+
+        # Query all necessary fields including Prod Hrs and Extra Hrs for calculation (Excluding deleted)
+        cur.execute("""
+            SELECT date, project_name, model_no, estimated_time,
+                     time_taken, production_hours, extra_hours, status, remarks
+            FROM operator_entries
+            WHERE emp_id = ? AND date = ? AND status != 'DELETED' AND deleted_time_log = '00:00'
+            ORDER BY id DESC;
+        """, (self.user["emp_id"], today))
+
+        rows = cur.fetchall()
+        conn.close()
+        
+        # --- Calculate remaining time for header display ---
+        # Fetching production_hours and extra_hours strings directly from DB logs
+        total_prod_consumed_float = sum(time_to_float(row[5]) for row in rows)
+        total_extra_float = sum(time_to_float(row[6]) for row in rows)
+        
+        max_capacity_float = 8.5 # 8 hours 30 minutes
+        remaining_float = max(0.0, max_capacity_float - total_prod_consumed_float)
+        remaining_time_str = float_to_time(remaining_float)
+        
+        # FIX: Ensure QTimeEdit is set correctly from HH:MM string components
+        h_rem, m_rem = map(int, remaining_time_str.split(':'))
+        self.prod.setTime(QtCore.QTime(h_rem, m_rem))
+        
+        total_extra_str = float_to_time(total_extra_float)
+        h_extra, m_extra = map(int, total_extra_str.split(':'))
+        self.extra.setTime(QtCore.QTime(h_extra, m_extra))
+
+
+        # --- Populate Table ---
+        self.history_table.setRowCount(len(rows))
+        
+        for r, row in enumerate(rows):
+            # Display Row (7 columns): [0:Date, 1:Project, 2:Model, 3:Estimated, 4:Taken, 5:Status, 6:Remarks]
+            display_row = list(row[0:5]) + [row[7]] + [row[8]]
+            
+            # Convert status 'Comp' to 'Complete' for display
+            if display_row[5] == 'Comp': display_row[5] = 'Complete'
+
+            for c, v in enumerate(display_row):
+                self.history_table.setItem(r, c, QtWidgets.QTableWidgetItem(str(v)))
+                
+        self.history_table.horizontalHeader().resizeSections(QtWidgets.QHeaderView.ResizeMode.ResizeToContents) # Force resize after data load
+        self.history_table.horizontalHeader().setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeMode.Stretch) # Remarks column stretch
+
+    # Added for global refresh call
+    def refresh_project_dropdowns(self):
+        # Update project data and reload history (which updates the dropdown)
+        self.project_data = self._load_project_data()
+        self.load_history()
+
+# ===================== PROJECT LEADER DASHBOARD (MODIFIED: Removed PL Manual Entry Tab) ======================
+class ProjectLeaderDashboard(QtWidgets.QWidget):
+    def __init__(self, db: DatabaseManager, user: dict, logout_callback=None): # ADDED USER
+        super().__init__()
+        self.db = db
+        self.user = user  # Store user info for personal entries
+        self.logout_callback = logout_callback 
+        
+        # Project lists for dropdowns will be updated in refresh()
+        self.project_list = []
+        self.operator_names = self._get_all_operator_names()
+        self.project_data = self._load_project_data_for_op_entry()
+        
+        # Define necessary table and widget attributes here to avoid AttributeError in refresh/load methods
+        self.pl_operator_history_table = SortableTableWidget()
+        self.monitor_detail_table = SortableTableWidget(3, 2)
+        self.monitor_table = SortableTableWidget()
+        # Removed self.table and self.proj as PL Manual Entry is removed.
+        
+        # Initialize UI elements used in refresh before calling refresh
+        self.pl_cb_project = QtWidgets.QComboBox()
+        self.mon_cb_project = QtWidgets.QComboBox()
+
+        self._build_ui()
+        self.refresh()
+        
+    def _get_all_operator_names(self):
+        conn = self.db._get_conn(); cur = conn.cursor(); cur.execute("SELECT emp_id, name FROM users WHERE role='Employee' OR role='Project Leader' ORDER BY name;");
+        operators = {f"{row[1]} ({row[0]})": row[0] for row in cur.fetchall()}; conn.close(); return operators
+    
+    def _load_project_data_for_op_entry(self):
+        data = self.db.get_all_projects_and_models(); projects = {}
+        for proj_name, model_no, est_time in data:
+            if proj_name not in projects: projects[proj_name] = {}; 
+            projects[proj_name][model_no] = est_time
+        return projects
+
+
+    # ------------------ BUILD UI (REMOVED PL MANUAL ENTRY TAB) ------------------
+    def _build_ui(self):
+        main = QtWidgets.QVBoxLayout(self); main.setContentsMargins(0, 0, 0, 0); main.setSpacing(0)
+
+        header = QtWidgets.QFrame(); header.setStyleSheet("background-color:#10793F;"); h = QtWidgets.QHBoxLayout(header); h.setContentsMargins(16, 8, 16, 8)
+        title = QtWidgets.QLabel("PROJECT LEADER DASHBOARD"); title_font = QtGui.QFont("Segoe UI", 14, QtGui.QFont.Weight.Bold); title.setFont(title_font); title.setStyleSheet("color:white;")
+        h.addWidget(title); h.addStretch()
+
+        logout_btn = QtWidgets.QPushButton("Logout"); logout_btn.setStyleSheet(""" QPushButton { background:#ffffff; color:#10793F; font-weight:bold; padding:6px 14px; border-radius:6px; } QPushButton:hover { background:#e6f2ec; } """); logout_btn.clicked.connect(self._logout); h.addWidget(logout_btn); main.addWidget(header)
+        
+        self.tabs = QtWidgets.QTabWidget(); main.addWidget(self.tabs)
+        
+        self._build_pl_operator_entry_tab()
+        self._build_monitoring_tab()
+        # Removed self._build_pl_manual_entry_tab()
+
+    def _logout(self):
+        if self.logout_callback: self.logout_callback()
+            
+    def _build_pl_operator_entry_tab(self):
+        op_tab = QtWidgets.QWidget(); layout = QtWidgets.QVBoxLayout(op_tab); layout.setContentsMargins(8, 8, 8, 8)
+        
+        header_frame = QtWidgets.QFrame(); header_frame.setStyleSheet("background-color: #e2f0d9; padding: 10px; border: 1px solid #ccc;"); h_grid = QtWidgets.QGridLayout(header_frame); h_grid.setSpacing(10)
+        
+        self.pl_date = QtWidgets.QDateEdit(QtCore.QDate.currentDate()); self.pl_date.setEnabled(False); self.pl_date.setDisplayFormat("yyyy-MM-dd"); self.pl_date.setStyleSheet("background:white;")
+        self.pl_prod = QtWidgets.QTimeEdit(); self.pl_prod.setEnabled(False); self.pl_prod.setDisplayFormat("HH:mm"); self.pl_prod.setStyleSheet("background:white;")
+        self.pl_extra = QtWidgets.QTimeEdit(); self.pl_extra.setEnabled(False); self.pl_extra.setDisplayFormat("HH:mm"); self.pl_extra.setStyleSheet("background:white;")
+        
+        h_grid.addWidget(QtWidgets.QLabel("Date:"), 0, 0); h_grid.addWidget(self.pl_date, 0, 1); h_grid.addWidget(QtWidgets.QLabel("Remaining Prod Hours:"), 1, 0); h_grid.addWidget(self.pl_prod, 1, 1); h_grid.addWidget(QtWidgets.QLabel("Total Extra Hrs Consumed:"), 2, 0); h_grid.addWidget(self.pl_extra, 2, 1); layout.addWidget(header_frame)
+        
+        entry_frame = QtWidgets.QFrame(); entry_frame.setStyleSheet("background-color:#d9ead3; padding:10px;"); entry_layout = QtWidgets.QGridLayout(entry_frame)
+
+        # self.pl_cb_project initialized in __init__
+        self.pl_cb_project.addItem("Select Project") 
+        self.pl_cb_model = QtWidgets.QComboBox(); self.pl_cb_model.setEnabled(False)
+        self.pl_cb_est_h = QtWidgets.QComboBox(); self.pl_cb_est_h.addItems([f"{i:02d}" for i in range(0, 100)]); self.pl_cb_est_h.setCurrentText("00"); self.pl_cb_est_h.setEnabled(False)
+        self.pl_cb_est_m = QtWidgets.QComboBox(); self.pl_cb_est_m.addItems(["00", "15", "30", "45"]); self.pl_cb_est_m.setCurrentText("00"); self.pl_cb_est_m.setEnabled(False)
+        
+        self.pl_cb_project.currentIndexChanged.connect(partial(self._update_pl_modules, self.pl_cb_project, self.pl_cb_model, self.pl_cb_est_h, self.pl_cb_est_m))
+        self.pl_cb_model.currentIndexChanged.connect(partial(self._update_pl_estimated_time, self.pl_cb_project, self.pl_cb_model, self.pl_cb_est_h, self.pl_cb_est_m))
+
+        
+        est_h_m_layout = QtWidgets.QHBoxLayout(); est_h_m_layout.addWidget(self.pl_cb_est_h); est_h_m_layout.addWidget(QtWidgets.QLabel(":")); est_h_m_layout.addWidget(self.pl_cb_est_m);
+        
+        self.pl_cb_taken_h = QtWidgets.QComboBox(); self.pl_cb_taken_h.addItems([f"{i:02d}" for i in range(0, 20)]); self.pl_cb_taken_h.setCurrentText("00")
+        self.pl_cb_taken_m = QtWidgets.QComboBox(); self.pl_cb_taken_m.addItems(["00", "15", "30", "45"]); self.pl_cb_taken_m.setCurrentText("00")
+        
+        # CHANGED: 'Comp' to 'Complete'
+        status_options = ["In hand", "Complete", "QC", "QA"]
+        self.pl_cb_status = QtWidgets.QComboBox(); self.pl_cb_status.addItems(status_options)
+        self.pl_remarks_edit = QtWidgets.QLineEdit()
+        
+        btn_submit = QtWidgets.QPushButton("Submit Entry"); btn_submit.clicked.connect(self._submit_pl_operator_entry)
+        
+        header_labels = ["Project Name", "Model No", "Est Hrs:Min", "Taken Hrs", "Taken Min", "Status", "Remarks", "Actions"]
+        for i, text in enumerate(header_labels):
+            lbl = QtWidgets.QLabel(text); lbl.setStyleSheet("font-weight:bold; color:black;"); entry_layout.addWidget(lbl, 0, i)
+        
+        entry_layout.addWidget(self.pl_cb_project, 1, 0); entry_layout.addWidget(self.pl_cb_model, 1, 1); entry_layout.addLayout(est_h_m_layout, 1, 2); 
+        entry_layout.addWidget(self.pl_cb_taken_h, 1, 3); entry_layout.addWidget(self.pl_cb_taken_m, 1, 4); entry_layout.addWidget(self.pl_cb_status, 1, 5); entry_layout.addWidget(self.pl_remarks_edit, 1, 6);
+        entry_layout.addWidget(btn_submit, 1, 7); entry_layout.setColumnStretch(6, 1);
+
+        layout.addWidget(entry_frame)
+        
+        self.pl_operator_history_table.setColumnCount(7); self.pl_operator_history_table.setHorizontalHeaderLabels(["Date", "Project", "Model", "Estimated", "Taken", "Status", "Remarks"])
+        self.pl_operator_history_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents); self.pl_operator_history_table.horizontalHeader().setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeMode.Stretch)
+
+        # CHANGED: Tab name to Project Leader Entry
+        layout.addWidget(self.pl_operator_history_table); self.tabs.addTab(op_tab, "Project Leader Entry")
+
+
+    def _build_monitoring_tab(self):
+        # This tab contains the advanced filtering and performance chart
+        mon_tab = QtWidgets.QWidget(); v_layout = QtWidgets.QVBoxLayout(mon_tab); v_layout.setContentsMargins(8, 8, 8, 8)
+
+        filter_group = QtWidgets.QGroupBox("Monitoring Filters"); f_layout = QtWidgets.QGridLayout(filter_group)
+        # self.mon_cb_project initialized in __init__
+        self.mon_cb_project.addItem("Select Project"); 
+        self.mon_cb_project.currentIndexChanged.connect(self._update_monitor_filters)
+        self.mon_cb_operator = QtWidgets.QComboBox(); self.mon_cb_operator.addItem("Select Operator"); 
+        for name_id, emp_id in self.operator_names.items(): self.mon_cb_operator.addItem(name_id, userData=emp_id)
+        self.mon_cb_model = QtWidgets.QComboBox(); self.mon_cb_model.addItem("Select Module");
+        
+        self.btn_monitor_load = QtWidgets.QPushButton("Run Report"); self.btn_monitor_load.clicked.connect(self._run_monitoring_report)
+
+        f_layout.addWidget(QtWidgets.QLabel("Project:"), 0, 0); f_layout.addWidget(self.mon_cb_project, 0, 1); f_layout.addWidget(QtWidgets.QLabel("Operator:"), 1, 0); f_layout.addWidget(self.mon_cb_operator, 1, 1); f_layout.addWidget(QtWidgets.QLabel("Module:"), 2, 0); f_layout.addWidget(self.mon_cb_model, 2, 1); f_layout.addWidget(self.btn_monitor_load, 3, 0, 1, 2); v_layout.addWidget(filter_group)
+        
+        self.monitor_chart_frame = QtWidgets.QFrame(); self.monitor_chart_frame.setStyleSheet("background-color:#fff; border:1px solid #ccc; padding:10px;")
+        self.monitor_chart_layout = QtWidgets.QVBoxLayout(self.monitor_chart_frame)
+        self.monitor_perf_title = QtWidgets.QLabel("Select filters and click 'Run Report' for performance status."); self.monitor_perf_title.setStyleSheet("font-weight:bold; font-size:12pt; color:#10793F;")
+        self.monitor_chart_layout.addWidget(self.monitor_perf_title)
+        
+        self.monitor_status_lbl = QtWidgets.QLabel("Status: N/A"); self.monitor_status_lbl.setStyleSheet("font-weight:bold; font-size:11pt;")
+        self.monitor_detail_table.setHorizontalHeaderLabels(["Metric", "Value"])
+        self.monitor_detail_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.monitor_detail_table.setItem(0, 0, QtWidgets.QTableWidgetItem("Total Entries Logged")); self.monitor_detail_table.setItem(1, 0, QtWidgets.QTableWidgetItem("Total Estimated Time")); self.monitor_detail_table.setItem(2, 0, QtWidgets.QTableWidgetItem("Total Time Taken"));
+        
+        self.monitor_chart_layout.addWidget(self.monitor_status_lbl); self.monitor_chart_layout.addWidget(self.monitor_detail_table); self.monitor_chart_layout.addStretch(); v_layout.addWidget(self.monitor_chart_frame)
+
+        self.monitor_table.setColumnCount(8); self.monitor_table.setHorizontalHeaderLabels(["Date", "Operator", "Module", "Est Time", "Time Taken", "Prod. Hrs", "Extra Hrs", "Status"])
+        self.monitor_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents); self.monitor_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch); v_layout.addWidget(self.monitor_table)
+
+        self.tabs.addTab(mon_tab, "Monitoring / Reports")
+
+
+    # Removed _build_pl_manual_entry_tab completely as requested (was responsible for the AttributeError)
+    def _build_pl_manual_entry_tab(self):
+        pass
+
+
+    # -------- Helper functions for PL Operator Entry (MODIFIED: Status conversion) --------
+    def _update_pl_modules(self, cb_proj, cb_model, cb_est_h, cb_est_m):
+        project_name = cb_proj.currentText(); cb_model.clear(); cb_est_h.setCurrentText("00"); cb_est_m.setCurrentText("00")
+        if project_name == "Select Project": cb_model.setEnabled(False); return
+        if project_name in self.project_data:
+            cb_model.setEnabled(True); cb_model.addItem("Select Module"); cb_model.addItems(sorted(self.project_data[project_name].keys()))
+        else: cb_model.setEnabled(False); cb_model.addItem("N/A")
+
+    def _update_pl_estimated_time(self, cb_proj, cb_model, cb_est_h, cb_est_m):
+        project_name = cb_proj.currentText(); model_no = cb_model.currentText(); cb_est_h.setCurrentText("00"); cb_est_m.setCurrentText("00")
+        if project_name in self.project_data and model_no in self.project_data[project_name]:
+            est_time_str = self.project_data[project_name][model_no]
+            try: h, m = map(int, est_time_str.split(':'))
+            except: h, m = 0, 0
+            cb_est_h.setCurrentText(f"{h:02d}"); cb_est_m.setCurrentText(f"{m:02d}")
+    
+    def _submit_pl_operator_entry(self):
+        project = self.pl_cb_project.currentText(); model = self.pl_cb_model.currentText(); est_time_str = f"{self.pl_cb_est_h.currentText()}:{self.pl_cb_est_m.currentText()}"; taken_time_str = f"{self.pl_cb_taken_h.currentText()}:{self.pl_cb_taken_m.currentText()}"
+        if project == "Select Project" or (project in self.project_data and model == "Select Module"): QtWidgets.QMessageBox.warning(self, "Missing", "Please select Project and Module."); return
+        if time_to_float(taken_time_str) == 0.0: QtWidgets.QMessageBox.warning(self, "Missing", "Time Taken cannot be 00:00."); return
+        
+        # Convert 'Complete' back to 'Comp' for DB storage
+        status = self.pl_cb_status.currentText()
+        if status == 'Complete': status = 'Comp'
+
+
+        self.db.save_operator_row(self.user, self.pl_date.date().toString("yyyy-MM-dd"), "00:00", "00:00", 1, project, model if model != "N/A" else "", est_time_str, taken_time_str, status, self.pl_remarks_edit.text().strip())
+        QtWidgets.QMessageBox.information(self, "Success", "Personal entry saved and hours calculated."); self.pl_remarks_edit.clear(); self.pl_cb_taken_h.setCurrentText("00"); self.pl_cb_taken_m.setCurrentText("00"); self._load_pl_operator_history()
+
+    def _load_pl_operator_history(self):
+        conn = self.db._get_conn(); cur = conn.cursor()
+        today = self.pl_date.date().toString("yyyy-MM-dd"); cur.execute("""
+            SELECT date, project_name, model_no, estimated_time,
+                     time_taken, production_hours, extra_hours, status, remarks
+            FROM operator_entries
+            WHERE emp_id = ? AND date = ? AND status != 'DELETED' AND deleted_time_log = '00:00'
+            ORDER BY id DESC;
+        """, (self.user["emp_id"], today)); rows = cur.fetchall(); conn.close()
+        
+        total_prod_consumed_float = sum(time_to_float(row[5]) for row in rows); total_extra_float = sum(time_to_float(row[6]) for row in rows)
+        max_capacity_float = 8.5; remaining_float = max(0.0, max_capacity_float - total_prod_consumed_float)
+        
+        h_rem, m_rem = map(int, float_to_time(remaining_float).split(':')); self.pl_prod.setTime(QtCore.QTime(h_rem, m_rem))
+        h_extra, m_extra = map(int, float_to_time(total_extra_float).split(':')); self.pl_extra.setTime(QtCore.QTime(h_extra, m_extra))
+        
+        self.pl_operator_history_table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            display_row = list(row[0:5]) + [row[7]] + [row[8]]
+            
+            # Convert status 'Comp' to 'Complete' for display
+            if display_row[5] == 'Comp': display_row[5] = 'Complete'
+
+            for c, v in enumerate(display_row): self.pl_operator_history_table.setItem(r, c, QtWidgets.QTableWidgetItem(str(v)))
+        self.pl_operator_history_table.horizontalHeader().resizeSections(QtWidgets.QHeaderView.ResizeMode.ResizeToContents); self.pl_operator_history_table.horizontalHeader().setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeMode.Stretch)
+
+    
+    # -------- Helper functions for Monitoring Tab (UNCHANGED) --------
+    def _update_monitor_filters(self):
+        project_name = self.mon_cb_project.currentText(); self.mon_cb_model.clear(); self.mon_cb_model.addItem("Select Module")
+        
+        self.mon_cb_operator.blockSignals(True); self.mon_cb_operator.clear(); self.mon_cb_operator.addItem("Select Operator")
+        
+        if project_name and project_name != "Select Project":
+            conn = self.db._get_conn(); cur = conn.cursor()
+            
+            # FIX applied here: removed 'oe' alias since the query is simple
+            cur.execute("""
+                SELECT DISTINCT oe.emp_id, u.name 
+                FROM operator_entries oe 
+                JOIN users u ON oe.emp_id = u.emp_id 
+                WHERE oe.project_name = ? 
+                AND oe.status != 'DELETED' AND oe.deleted_time_log = '00:00' 
+                ORDER BY u.name;
+            """, (project_name,))
+            operators = cur.fetchall(); 
+
+            for emp_id, name in operators: self.mon_cb_operator.addItem(f"{name} ({emp_id})", userData=emp_id)
+
+            cur.execute("""
+                SELECT DISTINCT model_no 
+                FROM operator_entries 
+                WHERE project_name = ? AND model_no != '' 
+                AND status != 'DELETED' AND deleted_time_log = '00:00' 
+                ORDER BY model_no;
+            """, (project_name,)); models = cur.fetchall(); conn.close()
+            for model_no in models: self.mon_cb_model.addItem(model_no[0])
+            
+        self.mon_cb_operator.blockSignals(False)
+
+    def _run_monitoring_report(self):
+        project_name = self.mon_cb_project.currentText(); operator_id = self.mon_cb_operator.currentData(); model_no = self.mon_cb_model.currentText()
+        
+        if project_name == "Select Project": QtWidgets.QMessageBox.warning(self, "Missing", "Please select a Project."); return
+        
+        query_re = """
+            SELECT date, name, model_no, estimated_time, time_taken, production_hours, extra_hours, status
+            FROM operator_entries
+            WHERE project_name = ? AND status != 'DELETED' AND deleted_time_log = '00:00'
+        """
+        params_re = [project_name]
+        
+        is_general_project_report = not operator_id and (not model_no or model_no == "Select Module")
+        
+        if operator_id: query_re += " AND emp_id = ?"; params_re.append(operator_id)
+        if model_no and model_no != "Select Module": query_re += " AND model_no = ?"; params_re.append(model_no)
+
+        query_re += " ORDER BY date DESC, id DESC;"
+        
+        conn_re = self.db._get_conn(); cur_re = conn_re.cursor(); cur_re.execute(query_re, params_re); report_rows_full = cur_re.fetchall(); conn_re.close()
+        
+        self.monitor_table.setRowCount(len(report_rows_full))
+        total_prod_hrs_float = 0.0; total_extra_hrs_float = 0.0
+        
+        for r_full, row_full in enumerate(report_rows_full):
+            # Convert status 'Comp' to 'Complete' for display
+            display_status = row_full[7]
+            if display_status == 'Comp': display_status = 'Complete'
+            
+            self.monitor_table.setItem(r_full, 0, QtWidgets.QTableWidgetItem(str(row_full[0]))); self.monitor_table.setItem(r_full, 1, QtWidgets.QTableWidgetItem(str(row_full[1]))); self.monitor_table.setItem(r_full, 2, QtWidgets.QTableWidgetItem(str(row_full[2]))); self.monitor_table.setItem(r_full, 3, QtWidgets.QTableWidgetItem(str(row_full[3]))); self.monitor_table.setItem(r_full, 4, QtWidgets.QTableWidgetItem(str(row_full[4]))); self.monitor_table.setItem(r_full, 5, QtWidgets.QTableWidgetItem(str(row_full[5]))); self.monitor_table.setItem(r_full, 6, QtWidgets.QTableWidgetItem(str(row_full[6]))); self.monitor_table.setItem(r_full, 7, QtWidgets.QTableWidgetItem(str(display_status)))
+            
+            total_prod_hrs_float += time_to_float(row_full[5]); total_extra_hrs_float += time_to_float(row_full[6])
+                
+        self.monitor_table.horizontalHeader().resizeSections(QtWidgets.QHeaderView.ResizeMode.ResizeToContents); self.monitor_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+
+        # --- Update Performance Chart Metrics (UNCHANGED) ---
+        target_est_float = 0.0
+        
+        if is_general_project_report:
+            conn_summary = self.db._get_conn(); cur_summary = conn_summary.cursor();
+            cur_summary.execute("""
+                SELECT pm.delivery_date, pm.total_estimated_hours, COALESCE((SELECT ae.dispatched FROM accounts_entries ae WHERE ae.project_name = pm.project_name ORDER BY ae.id DESC LIMIT 1), 'N/A') as dispatch_status
+                FROM projects_modules pm WHERE pm.project_name = ? GROUP BY pm.project_name;
+            """, (project_name,)); summary_row = cur_summary.fetchone(); conn_summary.close()
+
+            est_hours = summary_row[1] if summary_row else 0.0; dispatch_status = summary_row[2] if summary_row else 'N/A'
+            
+            self.monitor_perf_title.setText(f"Project Summary: {project_name} | Dispatch Status: {dispatch_status}")
+            
+            # FIX: Total Entries should be row 0, Total Est Time should be row 1, Total Taken should be row 2.
+            self.monitor_detail_table.setItem(2, 1, QtWidgets.QTableWidgetItem(str(len(report_rows_full)))); # Row 0: Total Entries Logged (Correct)
+            self.monitor_detail_table.setItem(1, 1, QtWidgets.QTableWidgetItem(f"{est_hours:.2f} hrs (Total Project Est.)")); # Row 1: Total Estimated Time 
+            self.monitor_detail_table.setItem(0, 1, QtWidgets.QTableWidgetItem(float_to_time(total_prod_hrs_float + total_extra_hrs_float))); # Row 2: Total Time Taken (Aggregated)
+            
+            self.monitor_status_lbl.setText(f"Overall Dispatch: {dispatch_status}"); self.monitor_status_lbl.setStyleSheet("font-weight:bold; font-size:11pt; color:blue;")
+
+        else:
+            # REPORT 2/3: Specific Operator/Module Performance
+            target_est_float = 0.0
+            if model_no and model_no != "Select Module":
+                conn_est = self.db._get_conn(); cur_est = conn_est.cursor(); cur_est.execute("""
+                    SELECT module_estimated_time FROM projects_modules
+                    WHERE project_name = ? AND model_no = ? ORDER BY id DESC LIMIT 1;
+                """, (project_name, model_no)); est_result = cur_est.fetchone(); conn_est.close()
+                if est_result: target_est_float = time_to_float(est_result[0])
+            
+            total_taken_sum_float = total_prod_hrs_float + total_extra_hrs_float
+
+            status = "No Data"
+            if target_est_float > 0 and total_taken_sum_float > 0:
+                diff = target_est_float - total_taken_sum_float
+                if diff >= target_est_float * 0.2: status = "Excellent (>= 20% faster)"
+                elif diff > 0: status = "Good (Faster)"
+                elif abs(diff) <= target_est_float * 0.05: status = "On Track (Matches Est.)"
+                elif diff > target_est_float * -0.2: status = "Fair (Up to 20% slower)"
+                else: status = "Needs Improvement (> 20% slower)"
+            elif total_taken_sum_float > 0: status = "Time Logged (Est. Missing)"
+
+            # FIX: Ensure correct assignment based on Metric Row definition
+            self.monitor_detail_table.setItem(2, 1, QtWidgets.QTableWidgetItem(str(len(report_rows_full)))) # Total Entries
+            self.monitor_detail_table.setItem(1, 1, QtWidgets.QTableWidgetItem(float_to_time(target_est_float))) # Total Estimated Time (Module Target)
+            self.monitor_detail_table.setItem(0, 1, QtWidgets.QTableWidgetItem(float_to_time(total_taken_sum_float))) # Total Time Taken
+            
+            self.monitor_perf_title.setText(f"Performance Report for Operator: {self.mon_cb_operator.currentText()} | Module: {model_no if model_no != 'Select Module' else 'All'}")
+            self.monitor_status_lbl.setText(f"Status: {status}")
+
+            if "Excellent" in status or "Good" in status or "On Track" in status: self.monitor_status_lbl.setStyleSheet("font-weight:bold; font-size:11pt; color:green;")
+            elif "Improvement" in status or "Fair" in status: self.monitor_status_lbl.setStyleSheet("font-weight:bold; font-size:11pt; color:red;")
+            else: self.monitor_status_lbl.setStyleSheet("font-weight:bold; font-size:11pt; color:black;")
+            
+            self.monitor_chart_frame.setStyleSheet("background-color:#fff; border:1px solid #ccc; padding:10px;")
+
+    # ------------------ PL Manual Entry Submit (REMOVED) ------------------
+    def submit(self):
+        # NOTE: This function is removed as PL Manual Entry is removed.
+        QtWidgets.QMessageBox.critical(self, "Error", "Manual Entry is disabled.")
+
+
+    # ------------------ LOAD PL Manual History (REMOVED) ------------------
+    def load_pl_entries(self):
+        # NOTE: This function is removed as PL Manual Entry is removed.
+        pass
+
+
+    # ------------------ REFRESH ALL (MODIFIED for project dropdowns and removed manual entry refresh) ------------------
+    def refresh(self):
+        # 1. Reload Project data for module/model info
+        self.project_data = self._load_project_data_for_op_entry() 
+        
+        # 2. Get list of non-dispatched projects
+        self.project_list = self.db.get_non_dispatched_projects_for_dropdown()
+        default_projects = ["Office meeting", "Celebration", "System problem", 
+                            "Training", "Power cut", "Permission", "Late", "Project discussion", "Half day Leave"]
+        combined_projects = sorted(self.project_list + default_projects)
+
+        # 3. Update dropdowns to only show non-dispatched projects
+        self.pl_cb_project.blockSignals(True)
+        current_pl_proj = self.pl_cb_project.currentText()
+        self.pl_cb_project.clear()
+        self.pl_cb_project.addItem("Select Project")
+        self.pl_cb_project.addItems(combined_projects)
+        idx = self.pl_cb_project.findText(current_pl_proj)
+        self.pl_cb_project.setCurrentIndex(idx if idx != -1 else 0)
+        self.pl_cb_project.blockSignals(False)
+
+        self.mon_cb_project.blockSignals(True)
+        current_mon_proj = self.mon_cb_project.currentText()
+        self.mon_cb_project.clear()
+        self.mon_cb_project.addItem("Select Project")
+        self.mon_cb_project.addItems(combined_projects)
+        idx = self.mon_cb_project.findText(current_mon_proj)
+        self.mon_cb_project.setCurrentIndex(idx if idx != -1 else 0)
+        self.mon_cb_project.blockSignals(False)
+        
+        # Removed manual entry tab dropdown update
+
+        # 4. Load history tables
+        self._load_pl_operator_history()
+
+    # Added for global refresh call
+    def refresh_project_dropdowns(self):
+        self.refresh()
+
+
+# ===================== ACCOUNTS DASHBOARD (UNCHANGED) ======================
+class AccountsDashboard(QtWidgets.QWidget):
+    def __init__(self, db: DatabaseManager, logout_callback=None):
+        super().__init__()
+        self.db = db
+        self.logout_callback = logout_callback
+        self.project_details = self._load_project_details() 
+        self._ui()
+        self.refresh()
+
+    def _load_project_details(self):
+        details = {}
+        project_data = self.db.get_all_project_names_with_details()
+        for name, est_hours, start_date, delivery_date in project_data:
+            if name:
+                details[name] = {
+                    'est_hours': est_hours,
+                    'start_date': start_date,
+                    'delivery_date': delivery_date
+                }
+        return details
+
+    def _ui(self):
+        main = QtWidgets.QVBoxLayout(self)
+        main.setContentsMargins(8, 8, 8, 8)
+        main.setSpacing(10)
+
+        # ---- Top green "ACCOUNTS" header ----
+        header_frame = QtWidgets.QFrame()
+        header_frame.setStyleSheet("background-color:#10793F;")
+        header_layout = QtWidgets.QHBoxLayout(header_frame)
+        header_layout.setContentsMargins(20, 8, 20, 8)
+
+        lbl = QtWidgets.QLabel("ACCOUNTS")
+        font = QtGui.QFont("Segoe UI", 14, QtGui.QFont.Weight.Bold)
+        lbl.setFont(font)
+        lbl.setStyleSheet("color:white;")
+        header_layout.addWidget(lbl)
+        header_layout.addStretch()
+
+        # LOGOUT BUTTON ADDED
+        logout_btn = QtWidgets.QPushButton("Logout")
+        logout_btn.setStyleSheet("""
+            QPushButton {
+                background:#ffffff;
+                color:#10793F;
+                font-weight:bold;
+                padding:6px 14px;
+                border-radius:6px;
+            }
+            QPushButton:hover { background:#e6f2ec; }
+        """)
+        logout_btn.clicked.connect(self._logout)
+        header_layout.addWidget(logout_btn)
+
+        main.addWidget(header_frame)
+
+        # ---- Entry row (top table) ----
+        entry_frame = QtWidgets.QFrame()
+        entry_frame.setStyleSheet("background-color:#e2f0d9; padding:8px;")
+        grid = QtWidgets.QGridLayout(entry_frame)
+        grid.setContentsMargins(6, 6, 6, 6)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(6)
+
+        headers = [
+            "Project Name", "Start Date", "Estimated Hours",
+            "Delivery Schedule", "Dispatched",
+            "Hours Taken", "Hours Difference",
+            "Invoice Date", "Payment Date", "Submit"
+        ]
+
+        for col, text in enumerate(headers):
+            h_lbl = QtWidgets.QLabel(text)
+            h_lbl.setStyleSheet(
+                "background-color:#a9d18e; font-weight:bold; padding:4px; border:1px solid #000;"
+            )
+            h_lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            grid.addWidget(h_lbl, 0, col)
+
+        # Widgets
+        # Project Name (Drop-down - populated with non-dispatched projects)
+        self.p_name = QtWidgets.QComboBox()
+        self.p_name.addItem("Select Project")
+        # Populate with non-dispatched projects during refresh
+
+        self.p_name.currentIndexChanged.connect(self._auto_populate_project_data) # Connect signal
+
+        # Start Date (Auto-populated)
+        self.start_date = QtWidgets.QDateEdit()
+        self.start_date.setCalendarPopup(True); self.start_date.setReadOnly(True)
+        self.start_date.setStyleSheet("background-color:#c9e2b1;") 
+
+        # Estimated Hours (Auto-populated)
+        self.est_hours = QtWidgets.QDoubleSpinBox()
+        self.est_hours.setRange(0, 9999); self.est_hours.setDecimals(2)
+        self.est_hours.setReadOnly(True); self.est_hours.setStyleSheet("background-color:#c9e2b1;") 
+        self.est_hours.valueChanged.connect(self._update_hours_diff) 
+
+        # Delivery Schedule (Auto-populated)
+        self.delivery = QtWidgets.QDateEdit()
+        self.delivery.setCalendarPopup(True); self.delivery.setReadOnly(True)
+        self.delivery.setStyleSheet("background-color:#c9e2b1;") 
+
+        # Dispatched (Manual Entry)
+        self.dispatched = QtWidgets.QLineEdit()
+        self.dispatched.setPlaceholderText("Yes / No / Details")
+
+        # Hours Taken (Auto-populated based on operator entries)
+        self.hours_taken = QtWidgets.QDoubleSpinBox()
+        self.hours_taken.setRange(0, 9999); self.hours_taken.setDecimals(2)
+        self.hours_taken.setReadOnly(True); self.hours_taken.setStyleSheet("background-color:#c9e2b1;") 
+        self.hours_taken.valueChanged.connect(self._update_hours_diff)
+
+        # Hours Difference (Auto-calculated)
+        self.hours_diff = QtWidgets.QDoubleSpinBox()
+        self.hours_diff.setRange(-9999, 9999); self.hours_diff.setDecimals(2)
+        self.hours_diff.setReadOnly(True); self.hours_diff.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+
+        # Invoice Date (Manual Entry)
+        self.invoice_date = QtWidgets.QDateEdit(QtCore.QDate.currentDate())
+        self.invoice_date.setCalendarPopup(True); self.invoice_date.setStyleSheet("background-color:#ddebf7;")
+
+        # Payment Date (Manual Entry)
+        self.payment_date = QtWidgets.QDateEdit(QtCore.QDate.currentDate())
+        self.payment_date.setCalendarPopup(True); self.payment_date.setStyleSheet("background-color:#ddebf7;")
+
+        self.btn_submit = QtWidgets.QPushButton("Submit")
+        self.btn_submit.setStyleSheet("background-color:#00b0f0; color:white; font-weight:bold;")
+        self.btn_submit.clicked.connect(self.save_entry)
+
+        # Row widgets
+        widgets = [
+            self.p_name, self.start_date, self.est_hours,
+            self.delivery, self.dispatched,
+            self.hours_taken, self.hours_diff,
+            self.invoice_date, self.payment_date, self.btn_submit
+        ]
+
+        for col, w in enumerate(widgets):
+            grid.addWidget(w, 1, col)
+            
+        # Search/Filter Bar
+        self.acc_search_edit = QtWidgets.QLineEdit()
+        self.acc_search_edit.setPlaceholderText("Search Accounts Entries...")
+        self.acc_search_edit.textChanged.connect(lambda text: self.table.filter_data(text))
+        grid.addWidget(self.acc_search_edit, 2, 0, 1, 4)
+
+
+        main.addWidget(entry_frame)
+
+        # ---- History table ----
+        self.table = SortableTableWidget()
+        # Added 1 column for Actions
+        self.table.setColumnCount(10)
+        self.table.setHorizontalHeaderLabels([
+            "Project Name", "Start Date", "Estimated Hours",
+            "Delivery Schedule", "Dispatched",
+            "Hours Taken", "Hours Difference",
+            "Invoice Date", "Payment Date", "Actions"
+        ])
+        # MODIFIED: Fixed column widths for Accounts History
+        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch) # Stretch Project Name
+        self.table.horizontalHeader().setSectionResizeMode(9, QtWidgets.QHeaderView.ResizeMode.Interactive) # Actions
+        
+        main.addWidget(self.table)
+    
+    # NEW LOGIC: Auto populate fields when a project is selected (UNCHANGED)
+    def _auto_populate_project_data(self):
+        project_name = self.p_name.currentText()
+        
+        # Reset fields
+        self.start_date.setDate(QtCore.QDate.currentDate())
+        self.delivery.setDate(QtCore.QDate.currentDate())
+        self.est_hours.setValue(0.0)
+        self.hours_taken.setValue(0.0)
+        self.hours_diff.setValue(0.0)
+        
+        if project_name == "Select Project" or not project_name:
+            return
+
+        if project_name in self.project_details:
+            details = self.project_details[project_name]
+
+            # 1. Estimated Hours (Total)
+            est_hours_float = details['est_hours']
+            self.est_hours.setValue(est_hours_float)
+
+            # 2. Start Date
+            try:
+                start_date_q = QtCore.QDate.fromString(details['start_date'], "yyyy-MM-dd")
+                if start_date_q.isValid():
+                    self.start_date.setDate(start_date_q)
+            except:
+                pass
+                
+            # 3. Delivery Date (Used for Delivery Schedule field)
+            try:
+                delivery_date_q = QtCore.QDate.fromString(details['delivery_date'], "yyyy-MM-dd")
+                if delivery_date_q.isValid():
+                    self.delivery.setDate(delivery_date_q)
+            except:
+                pass
+
+
+            # 4. Total Time Taken (Aggregated from operator_entries by ALL operators)
+            # Fetch the sum of time_taken from all operators for this project
+            total_taken_float = self.db.calculate_total_time_taken_for_project(project_name)
+            self.hours_taken.setValue(total_taken_float)
+
+            # 5. Calculate Difference
+            self._update_hours_diff()
+            
+        # Note: If project not in details, fields remain reset (0/current date)
+
+    # LOGOUT FUNCTION (UNCHANGED)
+    def _logout(self):
+        if self.logout_callback:
+            self.logout_callback()
+
+    def _update_hours_diff(self):
+        # Calculation: |Estimated Hours - Hours Taken| to show magnitude of difference
+        diff = abs(self.est_hours.value() - self.hours_taken.value())
+        self.hours_diff.setValue(diff)
+
+    def save_entry(self):
+        proj = self.p_name.currentText().strip()
+        
+        if proj == "Select Project":
+            QtWidgets.QMessageBox.warning(self, "Missing", "Please select a Project.")
+            return
+        
+        # NEW: Check for duplicate dispatched entry
+        if self.db.check_project_dispatched(proj):
+            QtWidgets.QMessageBox.critical(self, "Error", f"Project '{proj}' is already marked as Dispatched. Cannot create a new entry.")
+            return
+            
+        start = self.start_date.date().toString("yyyy-MM-dd")
+        est = float(self.est_hours.value())
+        delivery = self.delivery.date().toString("yyyy-MM-dd")
+        
+        # LOGIC FIX: Check dispatched status and normalize to 'YES'
+        disp = self.dispatched.text().strip()
+        disp_save = 'YES' if disp and disp.lower() in ['yes', 'y'] else disp
+            
+        taken = float(self.hours_taken.value())
+        diff = float(self.hours_diff.value()) 
+        inv = self.invoice_date.date().toString("yyyy-MM-dd")
+        pay = self.payment_date.date().toString("yyyy-MM-dd")
+
+        self.db.insert_accounts_entry(
+            proj, start, est, delivery, disp_save, taken, diff, inv, pay
+        )
+        QtWidgets.QMessageBox.information(self, "Saved", "Accounts entry saved.")
+        self.refresh()
+
+        # Resetting fields manually after successful save
+        self.p_name.setCurrentIndex(0) 
+        self.dispatched.clear()
+        self.est_hours.setValue(0.0)
+        self.hours_taken.setValue(0.0)
+        self.hours_diff.setValue(0.0)
+
+    def refresh(self):
+        # Reload project details (in case new projects were uploaded in Admin)
+        self.project_details = self._load_project_details()
+        
+        # Get list of non-dispatched projects
+        non_dispatched_projects = self.db.get_non_dispatched_project_names()
+        
+        # Store current project selection
+        current_project = self.p_name.currentText()
+        
+        self.p_name.blockSignals(True)
+        self.p_name.clear()
+        self.p_name.addItem("Select Project")
+        for name in sorted(non_dispatched_projects):
+            self.p_name.addItem(name)
+        self.p_name.blockSignals(False)
+
+        # Restore previous selection if possible
+        index = self.p_name.findText(current_project)
+        if index != -1:
+            self.p_name.setCurrentIndex(index)
+        else:
+            self.p_name.setCurrentIndex(0) # Select "Select Project"
+
+        # Load history table with ID column for actions
+        rows = self.db.list_accounts_entries_full() # Uses the new function
+        self.table.setRowCount(len(rows))
+        
+        for r, row in enumerate(rows):
+            entry_id = row[0] # The first element is the ID
+            display_row = row[1:] # Slice to get data columns only (9 columns)
+
+            for c, val in enumerate(display_row):
+                self.table.setItem(r, c, QtWidgets.QTableWidgetItem(str(val)))
+            
+            # Actions (Edit + Delete)
+            action_widget = QtWidgets.QWidget()
+            h = QtWidgets.QHBoxLayout(action_widget)
+            h.setContentsMargins(0, 0, 0, 0); h.setSpacing(4)
+
+            btn_edit = QtWidgets.QPushButton("Edit")
+            btn_edit.setStyleSheet("padding:2px 6px;")
+            # Pass the full record list including ID
+            btn_edit.clicked.connect(partial(self.edit_accounts_entry, list(row))) 
+            
+            btn_del = QtWidgets.QPushButton("Delete")
+            btn_del.setStyleSheet("padding:2px 6px;")
+            btn_del.clicked.connect(partial(self.delete_accounts_entry, entry_id))
+
+            h.addWidget(btn_edit); h.addWidget(btn_del); h.addStretch()
+
+            self.table.setCellWidget(r, 9, action_widget) # 10th column (index 9)
+                
+        self.table.horizontalHeader().resizeSections(QtWidgets.QHeaderView.ResizeMode.ResizeToContents) # Force resize after data load
+        self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch) # Stretch Project Name column
+        self.table.horizontalHeader().setSectionResizeMode(9, QtWidgets.QHeaderView.ResizeMode.Interactive) # Actions column interactive
+
+    def edit_accounts_entry(self, record):
+        """Handles the editing of an accounts entry."""
+        dlg = AccountsEditDialog(self, record, self.project_details)
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            (entry_id, proj, start, est, delivery, disp, taken, diff, inv, pay) = dlg.get_values()
+            
+            # Check if the updated entry makes a dispatched project un-dispatched, 
+            if disp == 'YES' and self.db.is_project_dispatched(proj, exclude_id=entry_id):
+                 QtWidgets.QMessageBox.critical(self, "Error", f"Project '{proj}' is already dispatched by another entry. Please verify dispatch history.")
+                 return
+                
+            try:
+                self.db.update_accounts_entry(entry_id, proj, start, est, delivery, disp, taken, diff, inv, pay)
+                QtWidgets.QMessageBox.information(self, "Success", "Accounts entry updated successfully.")
+                self.refresh()
+                # Global refresh call to update dropdowns in other dashboards (Operator/PL)
+                if isinstance(self.parent(), MainWindow):
+                    self.parent().refresh_project_dropdowns()
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Error", f"Failed to update entry: {e}")
+
+    def delete_accounts_entry(self, entry_id):
+        """Handles the deletion of an accounts entry."""
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Confirm Delete",
+            "Are you sure you want to permanently delete this accounts entry?",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
+        )
+        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+            self.db.delete_accounts_entry(entry_id)
+            QtWidgets.QMessageBox.information(self, "Deleted", "Accounts entry permanently deleted.")
+            self.refresh()
+            # Global refresh call to update dropdowns in other dashboards (Operator/PL)
+            if isinstance(self.parent(), MainWindow):
+                self.parent().refresh_project_dropdowns()
+
+    # Added for global refresh call
+    def refresh_project_dropdowns(self):
+        # Update internal project details and refresh dropdown lists
+        self.project_details = self._load_project_details()
+        self.refresh()
+            
+# ===================== MAIN WINDOW (MODIFIED: Initial Size and Refresh Fix) ======================
+class MainWindow(QtWidgets.QMainWindow, ExcelStyledWidget):
+    def __init__(self, db: DatabaseManager, user: dict):
+        super().__init__()
+        self.db = db
+        self.user = user
+
+        self.setWindowTitle("VMS Tool - Offline")
+        # Set a reasonable size for the dashboards
+        self.resize(1000, 700) 
+
+        self.current_widget = self._create_dashboard_widget(user.get("role", ""))
+
+        self.setCentralWidget(self.current_widget)
+        self.apply_excel_style()
+
+    def _create_dashboard_widget(self, role):
+        if role == "Admin":
+            return AdminDashboard(self.db, logout_callback=self.handle_logout)
+        elif role == "Project Leader":
+            return ProjectLeaderDashboard(self.db, self.user, logout_callback=self.handle_logout)
+        elif role == "Accounts":
+            return AccountsDashboard(self.db, logout_callback=self.handle_logout)
+        else:
+            return OperatorDashboard(self.db, self.user, logout_callback=self.handle_logout)
+            
+    def handle_logout(self):
+        self.login_win = LoginWindow(self.db)
+        self.login_win.show()
+        self.close()
+
+    def refresh_project_dropdowns(self):
+        """
+        Global method to trigger the refresh of project lists 
+        in active dashboards (Operator/PL/Accounts) after a change in Accounts.
+        """
+        # Ensure the current widget has the necessary refresh method
+        if hasattr(self.current_widget, 'refresh_project_dropdowns'):
+            self.current_widget.refresh_project_dropdowns()
+            
+# ===================== LOGIN WINDOW (MODIFIED: Initial Size) ======================
+class LoginWindow(QtWidgets.QWidget, ExcelStyledWidget):
+    def __init__(self, db: DatabaseManager):
+        super().__init__()
+        self.db = db
+        self._ui()
+        self.apply_excel_style()
+
+    def _ui(self):
+        self.setWindowTitle("VMS Tool")
+        # Initial size set to a small screen size as requested
+        self.setFixedSize(900, 600) 
+
+        root_layout = QtWidgets.QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+
+        header = QtWidgets.QFrame()
+        header.setFixedHeight(90)
+        header.setStyleSheet("background-color:#10793F;")
+        h_layout = QtWidgets.QHBoxLayout(header)
+        h_layout.setContentsMargins(20, 0, 0, 0)
+
+        title = QtWidgets.QLabel("VMS Tool")
+        title_font = QtGui.QFont("Segoe UI", 22, QtGui.QFont.Weight.Bold)
+        title.setFont(title_font)
+        title.setStyleSheet("color:white;")
+        h_layout.addWidget(title)
+        h_layout.addStretch()
+
+        root_layout.addWidget(header)
+
+        center_container = QtWidgets.QWidget()
+        center_layout = QtWidgets.QVBoxLayout(center_container)
+        center_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+
+        card = QtWidgets.QFrame()
+        card.setFixedSize(450, 320)
+        card.setStyleSheet("""
+            QFrame {
+                background:white;
+                border-radius:12px;
+                border:1px solid #d9d9d9;
+            }
+        """)
+
+        card_layout = QtWidgets.QVBoxLayout(card)
+        card_layout.setContentsMargins(30, 30, 30, 30)
+        card_layout.setSpacing(25)
+
+        form = QtWidgets.QGridLayout()
+        form.setHorizontalSpacing(20)
+        form.setVerticalSpacing(20)
+
+        label_style = "font-size: 14px; color: #333;"
+        box_style = """
+            QLineEdit {
+                padding: 8px;
+                border: 1px solid #ccc;
+                border-radius: 4px;
+            }
+            QLineEdit:focus {
+                border: 2px solid #10793F;
+            }
+        """
+
+        lbl_emp = QtWidgets.QLabel("Employee ID")
+        lbl_emp.setStyleSheet(label_style)
+        self.emp = QtWidgets.QLineEdit()
+        self.emp.setPlaceholderText("Enter Employee ID")
+        self.emp.setStyleSheet(box_style)
+
+        form.addWidget(lbl_emp, 0, 0)
+        form.addWidget(self.emp, 0, 1)
+
+        lbl_pass = QtWidgets.QLabel("Password")
+        lbl_pass.setStyleSheet(label_style)
+        self.passw = QtWidgets.QLineEdit()
+        self.passw.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.passw.setPlaceholderText("Enter Password")
+        self.passw.setStyleSheet(box_style)
+
+        form.addWidget(lbl_pass, 1, 0)
+        form.addWidget(self.passw, 1, 1)
+
+        card_layout.addLayout(form)
+
+        login_btn = QtWidgets.QPushButton("Login")
+        login_btn.setStyleSheet("""
+            QPushButton {
+                background-color:#10793F;
+                color:white;
+                padding:10px;
+                border-radius:6px;
+                font-size:14px;
+                font-weight:bold;
+            }
+            QPushButton:hover {
+                background-color:#0c5b30;
+            }
+        """)
+        login_btn.clicked.connect(self.login)
+
+        card_layout.addWidget(login_btn, alignment=QtCore.Qt.AlignmentFlag.AlignRight)
+
+        center_layout.addWidget(card)
+        root_layout.addWidget(center_container, stretch=1)
+
+    def login(self):
+        user = self.db.validate_user(self.emp.text().strip(), self.passw.text().strip())
+        if not user:
+            QtWidgets.QMessageBox.critical(self, "Error", "Invalid Employee ID or Password")
+            return
+
+        # Corrected the instantiation of MainWindow
+        self.main = MainWindow(self.db, user)
+        self.main.show()
+        self.close()
+
+
+# ===================== SPLASH SCREEN (UNCHANGED) ======================
+def show_splash(app):
+    pix = QtGui.QPixmap(420, 200)
+    pix.fill(QtGui.QColor("#10793F"))
+
+    painter = QtGui.QPainter(pix)
+    painter.setPen(QtGui.QColor("white"))
+    font = QtGui.QFont("Segoe UI", 22, QtGui.QFont.Weight.Bold)
+    painter.setFont(font)
+    painter.drawText(pix.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, "VMS TOOL")
+    painter.end()
+
+    splash = QtWidgets.QSplashScreen(pix)
+    splash.show()
+    app.processEvents()
+    QtCore.QThread.msleep(1500)
+    splash.close()
+
+
+# ===================== MAIN ENTRY (UNCHANGED) ======================
+def main():
+    # Check for pandas/openpyxl dependency at runtime
+    try:
+        import pandas as pd
+    except ImportError:
+        QtWidgets.QMessageBox.critical(None, "Dependency Error", 
+            "The 'pandas' library is required to run the VMS tool, especially for Admin's Excel feature. "
+            "Please install it along with 'openpyxl':\n\n"
+            "pip install pandas openpyxl"
+        )
+        sys.exit(1)
+        
+    app = QtWidgets.QApplication(sys.argv)
+    db = DatabaseManager(DB_NAME)
+    show_splash(app)
+
+    login = LoginWindow(db)
+    login.show()
+
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,8 @@
+import mongoose from 'mongoose';
+const {Schema,model}=mongoose;
+export const User=model('User',new Schema({emp_id:{type:String,required:true,unique:true,trim:true},name:{type:String,required:true},department:String,role:{type:String,enum:['Admin','Project Leader','Employee','Accounts'],required:true},password:{type:String,required:true},active:{type:Boolean,default:true}},{timestamps:true}));
+export const ProjectModule=model('ProjectModule',new Schema({project_name:{type:String,required:true},total_estimated_hours:{type:Number,default:0},delivery_date:String,start_date:String,model_no:{type:String,required:true},module_estimated_time:{type:String,default:'00:00'}},{timestamps:true}));
+export const OperatorEntry=model('OperatorEntry',new Schema({user_id:{type:Schema.Types.ObjectId,ref:'User'},emp_id:String,name:String,department:String,date:String,production_hours:String,extra_hours:String,sl_no:Number,project_name:String,model_no:String,estimated_time:String,time_taken:String,status:String,remarks:String,deleted_time_log:{type:String,default:'00:00'}},{timestamps:true}));
+export const ProjectLeaderEntry=model('ProjectLeaderEntry',new Schema({project_name:String,operator_name:String,date:String,total_hours:Number,comments:String},{timestamps:true}));
+export const AccountsEntry=model('AccountsEntry',new Schema({project_name:String,start_date:String,estimated_hours:Number,delivery_schedule:String,dispatched:String,hours_taken:Number,hours_difference:Number,invoice_date:String,payment_date:String},{timestamps:true}));
+export const Project=model('Project',new Schema({name:String,model_no:String,client:String,start_date:String,end_date:String,status:String},{timestamps:true}));
